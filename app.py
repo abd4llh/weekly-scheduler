@@ -419,24 +419,7 @@ def events_to_ics(events: List[Event], week_start: date, calendar_name="Weekly S
     lines.append("END:VCALENDAR")
     return "\r\n".join(fold_line(l) for l in lines) + "\r\n"
 
-DEFAULT_TASKS = """• Prepare paper with Federico (didn’t even start)
-• Finish extra experiments for the paper with Federico (around 10 hours)
-• Prepare paper with Giorgio (didn’t even start)
-• Finish extra experiments for the paper with Giorgio (around 10 hours)
-• Send the modified paper to Shirong to check (send an email, about 20 minutes)
-• Organize 4 different cabinets in the house (1 hour per cabinet)
-• Finish inkjet printing experiment (about 10 hours)
-• Gym (2 hours, 3 times a week, morning preferred)
-• Study German (30 minutes every day)
-• Clean my house (every week, arrange it throughout the week with different tasks every day)
-• Laundry (on the weekend every week)
-• Groceries (on Saturday usually)
-• Prepare grocery list (30 minutes on Saturday morning)
-• Raspberry Pi personal project
-• Personal development courses on Udemy
-• Cooking (2 hours every day)
-• Book lab devices (10 minutes usually on Thursday morning when I arrive at the office)
-• Talking with Israa, my wife (can be done alongside other tasks that don’t require high mental usage)
+DEFAULT_TASKS = """Wake up at 6:00 everyday
 """
 
 

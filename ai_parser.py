@@ -12,4 +12,8 @@ VALID_ENERGY = ["High", "Medium", "Low", "Physical", "Creative"]
 VALID_LOCATIONS = ["Lab", "Home", "Gym", "Any"]
 
 
-class
+class AIParserError(Exception):
+    pass
+
+
+def _allowed(value,

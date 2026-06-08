@@ -67,3 +67,26 @@ The parser now supports:
 - `on Monday at 09:30`
 
 Focus Guard is now disabled by default, and Focus Guard reminder blocks are excluded from the top workload metrics.
+
+
+## Phase 1 additions
+
+- Unscheduled-task tracking instead of silent failure.
+- Fixed-event conflict detection.
+- Validation warnings for missing/invalid fixed times, bad durations, conflicting events, and long tasks.
+- Better fixed-time parsing, including `Sunday 14:00`, `Sunday at 2 pm`, and time ranges like `14:00-15:30`.
+- Scheduling explanations in the table, calendar tooltip, and `.ics` descriptions.
+- Save/load task lists as JSON.
+
+Recommended quick tests:
+
+```text
+go to the doctor at sunday 14:00
+```
+
+```text
+go to the doctor at sunday 14:00
+meet Ahmad Sunday at 14:30
+```
+
+The second test should show a fixed-event conflict unless one task is marked as overlap-compatible.

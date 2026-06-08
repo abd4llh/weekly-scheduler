@@ -2,7 +2,7 @@ from typing import List, Dict
 from models import Event, UnscheduledTask, DAY_NAMES
 
 WORK_CATEGORIES = {"Work", "Lab", "Writing", "Admin"}
-PERSONAL_CATEGORIES = {"Health", "Home", "Learning", "Social", "Optional", "Other"}
+PERSONAL_CATEGORIES = {"Health", "Home", "Learning", "Social", "Optional"}
 RELATIONSHIP_CATEGORIES = {"Relationship"}
 
 def event_duration_h(event: Event) -> float:
@@ -52,6 +52,7 @@ def workload_summary(events: List[Event], unscheduled: List[UnscheduledTask]) ->
         "work_hours": round(sum(cats.get(c, 0) for c in WORK_CATEGORIES), 1),
         "personal_hours": round(sum(cats.get(c, 0) for c in PERSONAL_CATEGORIES), 1),
         "relationship_hours": round(sum(cats.get(c, 0) for c in RELATIONSHIP_CATEGORIES), 1),
+        "other_hours": round(cats.get("Other", 0), 1),
         "weekend_hours": round(sum(event_duration_h(e) for e in counted if e.day_index in [5, 6]), 1),
         "high_priority_blocks": sum(1 for e in counted if e.priority in ["Critical", "High"]),
         "unscheduled_count": len(unscheduled),
@@ -70,5 +71,6 @@ def by_day_dataframe(events: List[Event]):
             "Work h": round(sum(event_duration_h(e) for e in day_events if e.category in WORK_CATEGORIES), 1),
             "Personal h": round(sum(event_duration_h(e) for e in day_events if e.category in PERSONAL_CATEGORIES), 1),
             "Relationship h": round(sum(event_duration_h(e) for e in day_events if e.category in RELATIONSHIP_CATEGORIES), 1),
+            "Other h": round(sum(event_duration_h(e) for e in day_events if e.category == "Other"), 1),
         })
     return pd.DataFrame(rows)

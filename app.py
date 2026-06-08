@@ -1,4 +1,4 @@
-import re, uuid
+import re, uuid, json
 from dataclasses import dataclass, asdict
 from datetime import datetime, date, time, timedelta
 from typing import List, Optional, Tuple
@@ -38,6 +38,16 @@ class Event:
     end_min: int
     priority: str = "Medium"
     source_task: str = ""
+    notes: str = ""
+    explanation: str = ""
+
+@dataclass
+class UnscheduledTask:
+    title: str
+    reason: str
+    task_type: str = ""
+    priority: str = ""
+    duration_min: int = 0
     notes: str = ""
 
 
@@ -161,6 +171,7 @@ def clean_title(line: str) -> str:
 
     s = re.sub(rf"\b(?:on\s+|at\s+)?{day_pattern}\s+(?:at\s+)?(?:{time24}|{time12})\b", "", s, flags=re.I)
     s = re.sub(rf"\b(?:on\s+|at\s+)?{day_pattern}\b", "", s, flags=re.I)
+    s = re.sub(rf"\b(?:from\s+)?{time24}\s*(?:-|–|to|until)\s*{time24}\b", "", s, flags=re.I)
     s = re.sub(rf"\b(?:at\s+)?(?:{time24}|{time12})\b", "", s, flags=re.I)
 
     # Clean dangling prepositions and extra spacing.
@@ -229,17 +240,76 @@ def parse_tasks(raw_text: str) -> List[Task]:
         ))
     return tasks
 
+
+def validate_tasks(tasks: List[Task], wake_min: int, sleep_min: int) -> List[dict]:
+    """Return validation issues as dictionaries for easy display."""
+    issues = []
+    if wake_min >= sleep_min:
+        issues.append({"level": "error", "task": "Schedule settings", "message": "Wake time must be earlier than sleep target."})
+    fixed = []
+    for t in tasks:
+        if not str(t.title).strip():
+            issues.append({"level": "error", "task": "Untitled", "message": "Task has no title."})
+        if int(t.duration_min) <= 0:
+            issues.append({"level": "error", "task": t.title, "message": "Duration must be greater than 0 minutes."})
+        if t.task_type == "Fixed":
+            day = DAY_TO_INDEX.get(str(t.fixed_day).lower())
+            start = hhmm_to_minutes(str(t.fixed_start))
+            if day is None:
+                issues.append({"level": "error", "task": t.title, "message": "Fixed task needs a valid fixed_day."})
+            if start is None:
+                issues.append({"level": "error", "task": t.title, "message": "Fixed task needs a valid fixed_start such as 14:00."})
+            elif day is not None:
+                end = start + int(t.duration_min)
+                if start < wake_min or end > sleep_min:
+                    issues.append({"level": "warning", "task": t.title, "message": f"Fixed event {minutes_to_hhmm(start)}–{minutes_to_hhmm(end)} is outside the wake/sleep window."})
+                if not t.can_overlap:
+                    fixed.append((day, start, end, t.title))
+        if int(t.duration_min) > 8 * 60 and t.task_type != "Multi-session" and t.splittable:
+            issues.append({"level": "info", "task": t.title, "message": "Long task detected. Consider setting task_type to Multi-session."})
+        if int(t.max_block_min) < int(t.min_block_min):
+            issues.append({"level": "warning", "task": t.title, "message": "max_block_min is smaller than min_block_min."})
+    for i in range(len(fixed)):
+        d1, s1, e1, t1 = fixed[i]
+        for j in range(i+1, len(fixed)):
+            d2, s2, e2, t2 = fixed[j]
+            if d1 == d2 and max(s1, s2) < min(e1, e2):
+                issues.append({"level": "error", "task": f"{t1} / {t2}", "message": f"Fixed-event conflict on {DAY_NAMES[d1]}: {minutes_to_hhmm(s1)}–{minutes_to_hhmm(e1)} overlaps {minutes_to_hhmm(s2)}–{minutes_to_hhmm(e2)}."})
+    return issues
+
+
+def tasks_to_json(tasks: List[Task]) -> str:
+    payload = {"version": "0.3-phase1", "exported_at": datetime.utcnow().isoformat() + "Z", "tasks": [asdict(t) for t in tasks]}
+    return json.dumps(payload, indent=2, ensure_ascii=False)
+
+
+def tasks_from_json(data: str) -> List[Task]:
+    payload = json.loads(data)
+    raw_tasks = payload if isinstance(payload, list) else payload.get("tasks", [])
+    tasks = []
+    for item in raw_tasks:
+        kw = {f: item.get(f, Task.__dataclass_fields__[f].default) for f in Task.__dataclass_fields__}
+        tasks.append(Task(**kw))
+    return tasks
+
 class Scheduler:
     def __init__(self, wake_min=360, sleep_min=1380, slot_min=15, protect_weekend=True):
         self.wake_min, self.sleep_min, self.slot_min = wake_min, sleep_min, slot_min
         self.protect_weekend = protect_weekend
         self.events: List[Event] = []
+        self.unscheduled: List[UnscheduledTask] = []
         self.busy = {d: [] for d in range(7)}
+
+    def add_unscheduled(self, task: Task, reason: str):
+        self.unscheduled.append(UnscheduledTask(task.title, reason, task.task_type, task.priority, int(task.duration_min), task.notes))
+
+    def conflicts(self, day, start, end):
+        return [(s, e) for s, e in self.busy[day] if max(s, start) < min(e, end)]
 
     def is_free(self, day, start, end, allow_overlap=False):
         if start < self.wake_min or end > self.sleep_min or start >= end: return False
         if allow_overlap: return True
-        return all(max(s, start) >= min(e, end) for s, e in self.busy[day])
+        return len(self.conflicts(day, start, end)) == 0
 
     def add_event(self, e: Event, allow_overlap=False):
         self.events.append(e)
@@ -288,14 +358,24 @@ class Scheduler:
 
     def schedule_fixed(self, task: Task):
         day = DAY_TO_INDEX.get(str(task.fixed_day).lower())
-        start = hhmm_to_minutes(task.fixed_start)
-        if day is None: return False
+        start = hhmm_to_minutes(str(task.fixed_start))
+        if day is None:
+            self.add_unscheduled(task, "Fixed task has no valid day.")
+            return False
         if start is None:
-            start = 540 if task.preferred_time == "Morning" else 1080 if task.preferred_time == "Evening" else 600
-        if self.is_free(day, start, start + task.duration_min, task.can_overlap):
-            self.add_event(Event(task.title, day, start, start + task.duration_min, task.priority, task.title, task.notes), task.can_overlap)
-            return True
-        return False
+            self.add_unscheduled(task, "Fixed task has no valid start time, such as 14:00.")
+            return False
+        end = start + int(task.duration_min)
+        if start < self.wake_min or end > self.sleep_min:
+            self.add_unscheduled(task, f"Fixed time {minutes_to_hhmm(start)}–{minutes_to_hhmm(end)} is outside the wake/sleep window.")
+            return False
+        if not task.can_overlap and self.conflicts(day, start, end):
+            conflict_txt = "; ".join(f"{minutes_to_hhmm(s)}–{minutes_to_hhmm(e)}" for s, e in self.conflicts(day, start, end))
+            self.add_unscheduled(task, f"Fixed-event conflict with existing event(s): {conflict_txt}.")
+            return False
+        expl = f"Scheduled as a fixed event on {DAY_NAMES[day]} at {minutes_to_hhmm(start)} because the task specifies a fixed day/time."
+        self.add_event(Event(task.title, day, start, end, task.priority, task.title, task.notes, expl), task.can_overlap)
+        return True
 
     def schedule_recurring(self, task: Task):
         title = task.title.lower()
@@ -341,9 +421,16 @@ class Scheduler:
                 remaining -= block
         else:
             blocks = [task.duration_min]
+        scheduled_any = False
         for block in blocks:
             slot = self.find_slot(task, block)
-            if slot: self.add_event(Event(task.title, *slot, task.priority, task.title, task.notes), task.can_overlap)
+            if slot:
+                d, s, e = slot
+                expl = f"Placed on {DAY_NAMES[d]} {minutes_to_hhmm(s)}–{minutes_to_hhmm(e)} because it is {task.priority.lower()} priority and matches the {task.preferred_time.lower()} / {task.location.lower()} scheduling window."
+                self.add_event(Event(task.title, d, s, e, task.priority, task.title, task.notes, expl), task.can_overlap)
+                scheduled_any = True
+            else:
+                self.add_unscheduled(task, f"Could not fit a {block}-minute block into available compatible windows.")
 
     def schedule(self, tasks: List[Task], include_focus_guard=True):
         if include_focus_guard: self.add_focus_guard()
@@ -355,7 +442,7 @@ class Scheduler:
         rest.sort(key=lambda t: (PRIORITY_SCORE.get(t.priority, 2), ENERGY_SCORE.get(t.energy, 2), t.duration_min), reverse=True)
         for t in rest: self.schedule_flexible_or_multisession(t)
         self.events.sort(key=lambda e: (e.day_index, e.start_min, e.end_min))
-        return self.events
+        return self.events, self.unscheduled
 
 
 def adapt_tasks_for_mood(tasks: List[Task], mood: str) -> List[Task]:
@@ -411,7 +498,7 @@ def events_to_ics(events: List[Event], week_start: date, calendar_name="Weekly S
         lines += [
             "BEGIN:VEVENT", f"UID:{uuid.uuid4()}@weekly-scheduler-mvp", f"DTSTAMP:{stamp}",
             f"DTSTART;TZID={tzid}:{start_dt.strftime('%Y%m%dT%H%M%S')}", f"DTEND;TZID={tzid}:{end_dt.strftime('%Y%m%dT%H%M%S')}",
-            f"SUMMARY:{escape_ics_text(e.title)}", f"DESCRIPTION:{escape_ics_text(e.notes or e.source_task)}"
+            f"SUMMARY:{escape_ics_text(e.title)}", f"DESCRIPTION:{escape_ics_text((e.notes or e.source_task) + ('\n\nWhy scheduled here: ' + e.explanation if e.explanation else ''))}"
         ]
         if any(k in e.title.lower() for k in ["experiment", "gym", "german", "send", "book lab"]):
             lines += ["BEGIN:VALARM", "TRIGGER:-PT10M", "ACTION:DISPLAY", f"DESCRIPTION:{escape_ics_text(e.title)}", "END:VALARM"]
@@ -419,7 +506,24 @@ def events_to_ics(events: List[Event], week_start: date, calendar_name="Weekly S
     lines.append("END:VCALENDAR")
     return "\r\n".join(fold_line(l) for l in lines) + "\r\n"
 
-DEFAULT_TASKS = """Wake up at 6:00 everyday
+DEFAULT_TASKS = """• Prepare paper with Federico (didn’t even start)
+• Finish extra experiments for the paper with Federico (around 10 hours)
+• Prepare paper with Giorgio (didn’t even start)
+• Finish extra experiments for the paper with Giorgio (around 10 hours)
+• Send the modified paper to Shirong to check (send an email, about 20 minutes)
+• Organize 4 different cabinets in the house (1 hour per cabinet)
+• Finish inkjet printing experiment (about 10 hours)
+• Gym (2 hours, 3 times a week, morning preferred)
+• Study German (30 minutes every day)
+• Clean my house (every week, arrange it throughout the week with different tasks every day)
+• Laundry (on the weekend every week)
+• Groceries (on Saturday usually)
+• Prepare grocery list (30 minutes on Saturday morning)
+• Raspberry Pi personal project
+• Personal development courses on Udemy
+• Cooking (2 hours every day)
+• Book lab devices (10 minutes usually on Thursday morning when I arrive at the office)
+• Talking with Israa, my wife (can be done alongside other tasks that don’t require high mental usage)
 """
 
 
@@ -469,7 +573,7 @@ def render_calendar_html(events, week_start, start_hour=6, end_hour=23, px_per_h
             height = max(((end - start) / 60) * px_per_hour - 4, 20)
             klass = PRIORITY_CLASS.get(e.priority, "medium")
             title = html_escape_simple(e.title)
-            notes = html_escape_simple(e.notes or '')
+            notes = html_escape_simple(e.explanation or e.notes or '')
             time_txt = f"{minutes_to_hhmm(e.start_min)}–{minutes_to_hhmm(e.end_min)}"
             blocks.append(
                 f'<div class="event {klass}" style="top:{top}px;height:{height}px">'
@@ -544,7 +648,7 @@ st.markdown('''
 .hero-sub { color:#5f6368; font-size:15px; max-width:920px; }
 div[data-testid="stMetric"] { border:1px solid #dadce0; border-radius:16px; padding:10px 14px; background:#fff; }
 </style>
-<div class="hero"><div class="hero-title">Weekly Scheduler</div><div class="hero-sub">Messy task list → editable tasks → realistic weekly calendar → Google Calendar export.</div></div>
+<div class="hero"><div class="hero-title">Weekly Scheduler</div><div class="hero-sub">Phase 1: validation, unscheduled tasks, conflict detection, explanations, JSON save/load, and Google Calendar export.</div></div>
 ''', unsafe_allow_html=True)
 
 with st.sidebar:
@@ -591,7 +695,7 @@ def df_to_tasks(df):
         tasks.append(Task(**kw))
     return tasks
 
-tab_calendar, tab_tasks, tab_table = st.tabs(["📅 Calendar", "📝 Tasks", "📋 Table"])
+tab_calendar, tab_tasks, tab_issues, tab_table = st.tabs(["📅 Calendar", "📝 Tasks", "⚠️ Issues", "📋 Table"])
 
 with tab_tasks:
     st.subheader("1) Paste messy task list")
@@ -606,7 +710,7 @@ with tab_tasks:
         if "events" in st.session_state:
             del st.session_state["events"]
 
-    col_parse, col_hint = st.columns([1, 4])
+    col_parse, col_load, col_hint = st.columns([1.1, 1.1, 3.8])
     with col_parse:
         if st.button("Refresh task table", type="primary", use_container_width=True):
             st.session_state.parsed_tasks = parse_tasks(st.session_state.raw_task_text)
@@ -615,8 +719,23 @@ with tab_tasks:
             if "events" in st.session_state:
                 del st.session_state["events"]
             st.rerun()
+    with col_load:
+        uploaded = st.file_uploader("Load JSON", type=["json"], label_visibility="collapsed")
+        if uploaded is not None:
+            try:
+                loaded = tasks_from_json(uploaded.read().decode("utf-8"))
+                st.session_state.parsed_tasks = loaded
+                st.session_state.raw_task_text = "\n".join("• " + (t.notes or t.title) for t in loaded)
+                st.session_state.last_parsed_raw = st.session_state.raw_task_text
+                st.session_state.editor_version += 1
+                if "events" in st.session_state:
+                    del st.session_state["events"]
+                st.success("Loaded task JSON.")
+                st.rerun()
+            except Exception as exc:
+                st.error(f"Could not load JSON: {exc}")
     with col_hint:
-        st.caption("New lines in the task list are automatically parsed. Use this button if you want to force-refresh the editable table.")
+        st.caption("New lines are automatically parsed. You can also save/load the edited task list as JSON.")
 
     st.subheader("2) Review and edit parsed tasks")
     tasks_df = pd.DataFrame([asdict(t) for t in st.session_state.parsed_tasks])
@@ -640,35 +759,62 @@ with tab_tasks:
         if mood != "Normal":
             tasks = adapt_tasks_for_mood(tasks, mood)
         scheduler = Scheduler(wake_time.hour * 60 + wake_time.minute, sleep_time.hour * 60 + sleep_time.minute, protect_weekend=protect_weekend)
-        st.session_state.events = scheduler.schedule(tasks, include_focus_guard)
+        st.session_state.events, st.session_state.unscheduled = scheduler.schedule(tasks, include_focus_guard)
+        st.session_state.issues = validate_tasks(tasks, wake_time.hour * 60 + wake_time.minute, sleep_time.hour * 60 + sleep_time.minute)
         st.success("Calendar updated. Open the Calendar tab.")
+        st.download_button("Save reviewed task JSON", data=tasks_to_json(tasks).encode("utf-8"), file_name="weekly_scheduler_tasks.json", mime="application/json")
 
 if "events" not in st.session_state:
     tasks = st.session_state.parsed_tasks
     if mood != "Normal":
         tasks = adapt_tasks_for_mood(tasks, mood)
     scheduler = Scheduler(wake_time.hour * 60 + wake_time.minute, sleep_time.hour * 60 + sleep_time.minute, protect_weekend=protect_weekend)
-    st.session_state.events = scheduler.schedule(tasks, include_focus_guard)
+    st.session_state.events, st.session_state.unscheduled = scheduler.schedule(tasks, include_focus_guard)
+    st.session_state.issues = validate_tasks(tasks, wake_time.hour * 60 + wake_time.minute, sleep_time.hour * 60 + sleep_time.minute)
 
 events = st.session_state.events
-rows = [{"Day": DAY_NAMES[e.day_index], "Start": minutes_to_hhmm(e.start_min), "End": minutes_to_hhmm(e.end_min), "Task": e.title, "Priority": e.priority, "Notes": e.notes} for e in events]
+unscheduled = st.session_state.get("unscheduled", [])
+issues = st.session_state.get("issues", [])
+rows = [{"Day": DAY_NAMES[e.day_index], "Start": minutes_to_hhmm(e.start_min), "End": minutes_to_hhmm(e.end_min), "Task": e.title, "Priority": e.priority, "Explanation": e.explanation, "Notes": e.notes} for e in events]
 schedule_df = pd.DataFrame(rows)
 
 with tab_calendar:
-    c1, c2, c3, c4 = st.columns(4)
+    c1, c2, c3, c4, c5 = st.columns(5)
     counted_events = [e for e in events if e.source_task != "Focus Guard"]
     total_hours = sum((e.end_min - e.start_min) for e in counted_events) / 60
     high_count = sum(1 for e in counted_events if e.priority in ["Critical", "High"])
     weekend_hours = sum((e.end_min - e.start_min) for e in counted_events if e.day_index in [5, 6]) / 60
     c1.metric("Scheduled tasks", len(counted_events))
     c2.metric("Scheduled hours", f"{total_hours:.1f}")
-    c3.metric("High-priority blocks", high_count)
-    c4.metric("Weekend hours", f"{weekend_hours:.1f}")
+    c3.metric("Unscheduled", len(unscheduled))
+    c4.metric("High-priority blocks", high_count)
+    c5.metric("Weekend hours", f"{weekend_hours:.1f}")
+    if unscheduled:
+        st.warning(f"{len(unscheduled)} task(s) could not be fully scheduled. Check the Issues tab.")
 
     components.html(render_calendar_html(events, week_start, start_hour, end_hour, px_per_hour), height=(end_hour - start_hour)*px_per_hour + 190, scrolling=True)
     st.markdown("### Export")
     ics_content = events_to_ics(events, week_start=week_start)
     st.download_button("Download Google Calendar .ics", data=ics_content.encode("utf-8"), file_name="weekly_scheduler_export.ics", mime="text/calendar")
+
+with tab_issues:
+    st.markdown("### Validation warnings")
+    if not issues:
+        st.success("No validation issues found.")
+    else:
+        for issue in issues:
+            msg = f"**{issue['task']}** — {issue['message']}"
+            if issue['level'] == 'error': st.error(msg)
+            elif issue['level'] == 'warning': st.warning(msg)
+            else: st.info(msg)
+        st.dataframe(pd.DataFrame(issues), use_container_width=True, hide_index=True)
+
+    st.markdown("### Unscheduled or partially scheduled tasks")
+    if not unscheduled:
+        st.success("Everything was scheduled.")
+    else:
+        st.dataframe(pd.DataFrame([asdict(u) for u in unscheduled]), use_container_width=True, hide_index=True)
+
 
 with tab_table:
     st.markdown("### Schedule table")
@@ -676,7 +822,7 @@ with tab_table:
     st.markdown("### Day-by-day")
     for day in DAY_NAMES:
         with st.expander(day, expanded=day in ["Monday", "Tuesday"]):
-            st.dataframe(schedule_df[schedule_df["Day"] == day][["Start", "End", "Task", "Priority"]], use_container_width=True, hide_index=True)
+            st.dataframe(schedule_df[schedule_df["Day"] == day][["Start", "End", "Task", "Priority", "Explanation"]], use_container_width=True, hide_index=True)
     if not schedule_df.empty:
         st.markdown("### Workload summary")
         tmp = schedule_df.copy()

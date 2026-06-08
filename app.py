@@ -6,6 +6,7 @@ import streamlit as st
 import streamlit.components.v1 as components
 
 from calendar_utils import events_to_ics, next_monday, render_calendar_html
+from category_utils import normalize_task_categories
 from metrics_utils import by_day_dataframe, workload_summary
 from models import APP_VERSION, CATEGORIES, DAY_NAMES, PLANNING_MODES, PRIORITY_SCORE, Task
 from parser_utils import DEFAULT_TASKS, adapt_tasks_for_mood, minutes_to_hhmm, parse_tasks, tasks_from_json, tasks_to_json, validate_tasks
@@ -50,7 +51,7 @@ with st.sidebar:
 if "raw_task_text" not in st.session_state: st.session_state.raw_task_text = DEFAULT_TASKS
 if "last_parsed_raw" not in st.session_state: st.session_state.last_parsed_raw = st.session_state.raw_task_text
 if "editor_version" not in st.session_state: st.session_state.editor_version = 0
-if "parsed_tasks" not in st.session_state: st.session_state.parsed_tasks = parse_tasks(st.session_state.raw_task_text)
+if "parsed_tasks" not in st.session_state: st.session_state.parsed_tasks = normalize_task_categories(parse_tasks(st.session_state.raw_task_text))
 
 def df_to_tasks(df):
     out = []
@@ -62,10 +63,10 @@ def df_to_tasks(df):
             except Exception: kw[k] = int(Task.__dataclass_fields__[k].default)
         kw["splittable"] = bool(kw["splittable"]); kw["can_overlap"] = bool(kw["can_overlap"])
         out.append(Task(**kw))
-    return out
+    return normalize_task_categories(out)
 
 def run_schedule(tasks):
-    rows = adapt_tasks_for_mood(tasks, mood) if mood != "Normal" else tasks
+    rows = normalize_task_categories(adapt_tasks_for_mood(tasks, mood) if mood != "Normal" else tasks)
     sch = Scheduler(wake_time.hour*60+wake_time.minute, sleep_time.hour*60+sleep_time.minute, protect_weekend=protect_weekend, planning_mode=planning_mode)
     st.session_state.events, st.session_state.unscheduled = sch.schedule(rows, include_focus_guard)
     st.session_state.issues = validate_tasks(rows, wake_time.hour*60+wake_time.minute, sleep_time.hour*60+sleep_time.minute)
@@ -77,14 +78,14 @@ with tab_tasks:
     st.caption("Paste a messy list. The app parses it into editable scheduling fields.")
     raw = st.text_area("Task list", height=320, key="raw_task_text", label_visibility="collapsed")
     if raw != st.session_state.last_parsed_raw:
-        st.session_state.parsed_tasks = parse_tasks(raw)
+        st.session_state.parsed_tasks = normalize_task_categories(parse_tasks(raw))
         st.session_state.last_parsed_raw = raw
         st.session_state.editor_version += 1
         for k in ["events","unscheduled","issues"]: st.session_state.pop(k, None)
     c1,c2,c3 = st.columns([1.2,1.2,4])
     with c1:
         if st.button("Refresh parse", type="primary", use_container_width=True):
-            st.session_state.parsed_tasks = parse_tasks(st.session_state.raw_task_text)
+            st.session_state.parsed_tasks = normalize_task_categories(parse_tasks(st.session_state.raw_task_text))
             st.session_state.last_parsed_raw = st.session_state.raw_task_text
             st.session_state.editor_version += 1
             st.rerun()
@@ -92,7 +93,7 @@ with tab_tasks:
         uploaded = st.file_uploader("Load JSON", type=["json"], label_visibility="collapsed")
         if uploaded is not None:
             try:
-                loaded = tasks_from_json(uploaded.read().decode("utf-8"))
+                loaded = normalize_task_categories(tasks_from_json(uploaded.read().decode("utf-8")))
                 st.session_state.parsed_tasks = loaded
                 st.session_state.raw_task_text = "\n".join("• " + (t.notes or t.title) for t in loaded)
                 st.session_state.last_parsed_raw = st.session_state.raw_task_text
@@ -139,7 +140,8 @@ with tab_calendar:
     m3.metric("Personal", f"{summary['personal_hours']:.1f} h")
     m4.metric("Relationship", f"{summary['relationship_hours']:.1f} h")
     m5.metric("Unscheduled", int(summary['unscheduled_count']))
-    st.caption(f"Scheduled time: {summary['scheduled_hours']:.1f} h · overlap: {summary['overlap_hours']:.1f} h · weekend: {summary['weekend_hours']:.1f} h · mode: {planning_mode}")
+    extra = f" · other: {summary['other_hours']:.1f} h" if summary.get('other_hours', 0) else ""
+    st.caption(f"Scheduled time: {summary['scheduled_hours']:.1f} h · overlap: {summary['overlap_hours']:.1f} h · weekend: {summary['weekend_hours']:.1f} h{extra} · mode: {planning_mode}")
     components.html(render_calendar_html(events, week_start, start_hour, end_hour, px_per_hour), height=(end_hour-start_hour)*px_per_hour+190, scrolling=True)
     st.download_button("Download Google Calendar .ics", data=events_to_ics(events, week_start).encode("utf-8"), file_name="weekly_scheduler_export.ics", mime="text/calendar")
 
@@ -159,5 +161,7 @@ with tab_table:
     st.subheader("Schedule table")
     st.dataframe(schedule_df, use_container_width=True, hide_index=True)
     st.subheader("Workload by day")
-    st.dataframe(by_day_dataframe(events), use_container_width=True, hide_index=True)
-    st.bar_chart(by_day_dataframe(events).set_index("Day")[["True occupied h", "Work h", "Personal h", "Relationship h"]])
+    day_df = by_day_dataframe(events)
+    st.dataframe(day_df, use_container_width=True, hide_index=True)
+    chart_cols = [c for c in ["True occupied h", "Work h", "Personal h", "Relationship h", "Other h"] if c in day_df.columns]
+    st.bar_chart(day_df.set_index("Day")[chart_cols])

@@ -11,6 +11,7 @@ from category_utils import normalize_task_categories
 from metrics_utils import by_day_dataframe, workload_summary
 from models import APP_VERSION, CATEGORIES, DAY_NAMES, PLANNING_MODES, PRIORITY_SCORE, Task
 from parser_utils import DEFAULT_TASKS, adapt_tasks_for_mood, minutes_to_hhmm, parse_tasks, tasks_from_json, tasks_to_json, validate_tasks
+from plan_health import evaluate_plan_health
 from scheduler_engine import Scheduler
 
 st.set_page_config(page_title="Weekly Scheduler", page_icon="🗓️", layout="wide", initial_sidebar_state="expanded")
@@ -79,11 +80,12 @@ def ordered_day_df(events):
 
 def render_workload_charts(day_df):
     st.markdown("#### True occupied hours")
+    st.caption("Actual clock time blocked per day after merging overlapping events.")
     occupied_chart = (
         alt.Chart(day_df)
         .mark_bar()
         .encode(
-            x=alt.X("Day:N", sort=DAY_NAMES, title=None),
+            x=alt.X("Day:N", sort=DAY_NAMES, title=None, axis=alt.Axis(labelAngle=0)),
             y=alt.Y("True occupied h:Q", title="Hours"),
             tooltip=["Day", "True occupied h"],
         )
@@ -92,6 +94,7 @@ def render_workload_charts(day_df):
     st.altair_chart(occupied_chart, use_container_width=True)
 
     st.markdown("#### Category breakdown")
+    st.caption("Scheduled category time. This may be higher than true occupied hours because overlap is allowed for relationship time.")
     long_df = day_df.melt(
         id_vars="Day",
         value_vars=[c for c in ["Work h", "Personal h", "Relationship h", "Other h"] if c in day_df.columns],
@@ -103,14 +106,28 @@ def render_workload_charts(day_df):
         alt.Chart(long_df)
         .mark_bar()
         .encode(
-            x=alt.X("Day:N", sort=DAY_NAMES, title=None),
-            y=alt.Y("Hours:Q", title="Hours"),
+            x=alt.X("Day:N", sort=DAY_NAMES, title=None, axis=alt.Axis(labelAngle=0)),
+            y=alt.Y("Hours:Q", title="Scheduled category hours"),
             color=alt.Color("Category:N", title="Category"),
             tooltip=["Day", "Category", "Hours"],
         )
         .properties(height=280)
     )
     st.altair_chart(category_chart, use_container_width=True)
+
+def render_plan_health(summary, planning_mode):
+    level, messages, recommendations = evaluate_plan_health(summary, planning_mode)
+    text = "  \n".join([f"• {m}" for m in messages])
+    if recommendations:
+        text += "\n\nRecommended actions:  \n" + "  \n".join([f"• {r}" for r in recommendations])
+    if level == "error":
+        st.error(text)
+    elif level == "warning":
+        st.warning(text)
+    elif level == "info":
+        st.info(text)
+    else:
+        st.success(text)
 
 tab_calendar, tab_tasks, tab_issues, tab_table = st.tabs(["Calendar", "Tasks", "Issues", "Table"])
 
@@ -174,7 +191,6 @@ summary = workload_summary(events, unscheduled)
 schedule_df = pd.DataFrame([{"Day":DAY_NAMES[e.day_index],"Start":minutes_to_hhmm(e.start_min),"End":minutes_to_hhmm(e.end_min),"Task":e.title,"Category":e.category,"Priority":e.priority,"Explanation":e.explanation,"Notes":e.notes} for e in events])
 
 with tab_calendar:
-    if unscheduled: st.warning(f"{len(unscheduled)} task(s) could not be fully scheduled. Check the Issues tab.")
     m1,m2,m3,m4,m5 = st.columns(5)
     m1.metric("True occupied", f"{summary['true_occupied_hours']:.1f} h")
     m2.metric("Work", f"{summary['work_hours']:.1f} h")
@@ -183,6 +199,7 @@ with tab_calendar:
     m5.metric("Unscheduled", int(summary['unscheduled_count']))
     extra = f" · other: {summary['other_hours']:.1f} h" if summary.get('other_hours', 0) else ""
     st.caption(f"Scheduled time: {summary['scheduled_hours']:.1f} h · overlap: {summary['overlap_hours']:.1f} h · weekend: {summary['weekend_hours']:.1f} h{extra} · mode: {planning_mode}")
+    render_plan_health(summary, planning_mode)
     components.html(render_calendar_html(events, week_start, start_hour, end_hour, px_per_hour), height=(end_hour-start_hour)*px_per_hour+190, scrolling=True)
     st.download_button("Download Google Calendar .ics", data=events_to_ics(events, week_start).encode("utf-8"), file_name="weekly_scheduler_export.ics", mime="text/calendar")
 

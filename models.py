@@ -3,9 +3,12 @@ from dataclasses import dataclass
 DAY_NAMES = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
 DAY_SHORT = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
 DAY_TO_INDEX = {d.lower(): i for i, d in enumerate(DAY_NAMES)} | {d.lower(): i for i, d in enumerate(DAY_SHORT)}
+
 PRIORITY_SCORE = {"Critical": 4, "High": 3, "Medium": 2, "Low": 1, "Optional": 0}
 ENERGY_SCORE = {"High": 3, "Medium": 2, "Physical": 2, "Creative": 2, "Low": 1}
-APP_VERSION = "Weekly Scheduler v0.4.0 — modular Phase 1"
+CATEGORIES = ["Work", "Lab", "Writing", "Admin", "Health", "Home", "Relationship", "Social", "Learning", "Optional", "Focus", "Other"]
+PLANNING_MODES = ["Balanced week", "Work-heavy week", "Recovery week", "Deadline mode", "Social weekend mode"]
+APP_VERSION = "Weekly Scheduler v0.5.0 — Phase 2 prep"
 
 @dataclass
 class Task:
@@ -24,6 +27,7 @@ class Task:
     max_block_min: int = 180
     can_overlap: bool = False
     notes: str = ""
+    category: str = "Other"
 
 @dataclass
 class Event:
@@ -35,6 +39,7 @@ class Event:
     source_task: str = ""
     notes: str = ""
     explanation: str = ""
+    category: str = "Other"
 
 @dataclass
 class UnscheduledTask:
@@ -44,3 +49,4 @@ class UnscheduledTask:
     priority: str = ""
     duration_min: int = 0
     notes: str = ""
+    category: str = "Other"

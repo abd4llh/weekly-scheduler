@@ -8,6 +8,10 @@ class Scheduler:
         self.events: List[Event] = []
         self.unscheduled: List[UnscheduledTask] = []
         self.busy = {d: [] for d in range(7)}
+        self.flex_load = {d: 0 for d in range(7)}
+        self.high_load = {d: 0 for d in range(7)}
+        self.daily_flex_cap = {0: 420, 1: 420, 2: 420, 3: 420, 4: 360, 5: 240, 6: 180}
+        self.daily_high_cap = {0: 360, 1: 360, 2: 360, 3: 360, 4: 300, 5: 60, 6: 0}
 
     def add_unscheduled(self, t: Task, reason: str):
         if not any(u.title == t.title and u.reason == reason for u in self.unscheduled):
@@ -20,11 +24,27 @@ class Scheduler:
         if s < self.wake_min or e > self.sleep_min or s >= e: return False
         return True if allow else not self.conflicts(d,s,e)
 
-    def add_event(self, e: Event, allow=False):
+    def fits_load(self, d, dur, t: Task):
+        # Fixed and recurring routines are allowed to exist even if the day is full.
+        # Flexible/multi-session tasks are capacity-limited to avoid unrealistic packing.
+        if t.task_type not in ["Flexible", "Multi-session"]:
+            return True
+        if self.flex_load[d] + dur > self.daily_flex_cap[d]:
+            return False
+        if t.energy == "High" and self.high_load[d] + dur > self.daily_high_cap[d]:
+            return False
+        return True
+
+    def add_event(self, e: Event, allow=False, source_task: Task = None):
         self.events.append(e)
         if not allow:
             self.busy[e.day_index].append((e.start_min, e.end_min, e.title))
             self.busy[e.day_index].sort()
+        if source_task and source_task.task_type in ["Flexible", "Multi-session"]:
+            dur = e.end_min - e.start_min
+            self.flex_load[e.day_index] += dur
+            if source_task.energy == "High":
+                self.high_load[e.day_index] += dur
 
     def windows(self, t: Task):
         w=[]
@@ -43,6 +63,7 @@ class Scheduler:
             if not self.protect_weekend or t.priority in ["Critical","High"]:
                 for d in [5,6]: w += [(d,540,720,"weekend fallback"),(d,840,1020,"weekend fallback")]
         if t.priority == "Optional":
+            # Optional tasks are rewards, not schedule fillers. Keep them late-week only.
             w = [(4,1080,1200,"optional Friday"),(5,960,1140,"optional weekend"),(6,840,1020,"optional Sunday")]
         return w
 
@@ -51,6 +72,8 @@ class Scheduler:
         if preferred_days:
             wins = [x for x in wins if x[0] in preferred_days] + [x for x in wins if x[0] not in preferred_days]
         for d,a,b,why in wins:
+            if not self.fits_load(d, dur, t):
+                continue
             s=a
             while s + dur <= b:
                 if self.is_free(d,s,s+dur,t.can_overlap):
@@ -115,11 +138,11 @@ class Scheduler:
             for block in range(max_block, min_block-1, -15):
                 slot = self.find_slot(t, block)
                 if slot:
-                    self.add_event(Event(t.title,*slot[:3],t.priority,t.title,t.notes,slot[3]), t.can_overlap)
+                    self.add_event(Event(t.title,*slot[:3],t.priority,t.title,t.notes,slot[3]), t.can_overlap, source_task=t)
                     remaining -= block; scheduled += block; placed=True; break
             if not placed: break
         if remaining > 0:
-            self.add_unscheduled(t, f"Scheduled {scheduled}/{total} minutes; {remaining} minutes did not fit.")
+            self.add_unscheduled(t, f"Scheduled {scheduled}/{total} minutes; {remaining} minutes did not fit within realistic daily capacity limits.")
 
     def schedule(self, tasks: List[Task], include_focus_guard=False):
         if include_focus_guard: self.add_focus_guard()

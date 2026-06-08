@@ -1,6 +1,7 @@
 from dataclasses import asdict
 from datetime import date, time
 
+import altair as alt
 import pandas as pd
 import streamlit as st
 import streamlit.components.v1 as components
@@ -70,6 +71,46 @@ def run_schedule(tasks):
     sch = Scheduler(wake_time.hour*60+wake_time.minute, sleep_time.hour*60+sleep_time.minute, protect_weekend=protect_weekend, planning_mode=planning_mode)
     st.session_state.events, st.session_state.unscheduled = sch.schedule(rows, include_focus_guard)
     st.session_state.issues = validate_tasks(rows, wake_time.hour*60+wake_time.minute, sleep_time.hour*60+sleep_time.minute)
+
+def ordered_day_df(events):
+    df = by_day_dataframe(events)
+    df["Day"] = pd.Categorical(df["Day"], categories=DAY_NAMES, ordered=True)
+    return df.sort_values("Day")
+
+def render_workload_charts(day_df):
+    st.markdown("#### True occupied hours")
+    occupied_chart = (
+        alt.Chart(day_df)
+        .mark_bar()
+        .encode(
+            x=alt.X("Day:N", sort=DAY_NAMES, title=None),
+            y=alt.Y("True occupied h:Q", title="Hours"),
+            tooltip=["Day", "True occupied h"],
+        )
+        .properties(height=260)
+    )
+    st.altair_chart(occupied_chart, use_container_width=True)
+
+    st.markdown("#### Category breakdown")
+    long_df = day_df.melt(
+        id_vars="Day",
+        value_vars=[c for c in ["Work h", "Personal h", "Relationship h", "Other h"] if c in day_df.columns],
+        var_name="Category",
+        value_name="Hours",
+    )
+    long_df = long_df[long_df["Hours"] > 0]
+    category_chart = (
+        alt.Chart(long_df)
+        .mark_bar()
+        .encode(
+            x=alt.X("Day:N", sort=DAY_NAMES, title=None),
+            y=alt.Y("Hours:Q", title="Hours"),
+            color=alt.Color("Category:N", title="Category"),
+            tooltip=["Day", "Category", "Hours"],
+        )
+        .properties(height=280)
+    )
+    st.altair_chart(category_chart, use_container_width=True)
 
 tab_calendar, tab_tasks, tab_issues, tab_table = st.tabs(["Calendar", "Tasks", "Issues", "Table"])
 
@@ -161,7 +202,6 @@ with tab_table:
     st.subheader("Schedule table")
     st.dataframe(schedule_df, use_container_width=True, hide_index=True)
     st.subheader("Workload by day")
-    day_df = by_day_dataframe(events)
+    day_df = ordered_day_df(events)
     st.dataframe(day_df, use_container_width=True, hide_index=True)
-    chart_cols = [c for c in ["True occupied h", "Work h", "Personal h", "Relationship h", "Other h"] if c in day_df.columns]
-    st.bar_chart(day_df.set_index("Day")[chart_cols])
+    render_workload_charts(day_df)

@@ -136,7 +136,7 @@ def parse_tasks(raw: str) -> List[Task]:
         if ("groceries" in low or "grocery shopping" in low) and "grocery list" not in low: day, start, typ, dur = "Saturday", start or "10:00", "Fixed", 120
         if "laundry" in low: day, start, typ, dur, loc = "Sunday", start or "09:45", "Fixed", 60, "Home"
         if "talking with" in low or "israa" in low or "wife" in low: typ, sess, pref, dur, overlap = "Recurring", 7, "Evening", max(dur, 150), True
-        if "cooking" in low: typ, sess, pref, dur, overlap, loc = "Recurring", 7, "Evening", 120, True, "Home"
+        if "cooking" in low: typ, sess, pref, dur, overlap, loc = "Recurring", 7, "Evening", 120, False, "Home"
         if "german" in low: typ, sess, pref, dur = "Recurring", 7, "Morning", 30
         if "gym" in low: typ, sess, pref, dur, loc, energy = "Recurring", 3, "Morning", 120, "Gym", "Physical"
         if "cabinet" in low: typ, sess, dur, loc, energy, pref = "Multi-session", 4, 60, "Home", "Low", "Weekend"
@@ -169,7 +169,7 @@ def validate_tasks(tasks: List[Task], wake_min: int, sleep_min: int):
     return issues
 
 def tasks_to_json(tasks: List[Task]) -> str:
-    return json.dumps({"version":"0.4.0","exported_at":datetime.utcnow().isoformat()+"Z","tasks":[asdict(t) for t in tasks]}, indent=2, ensure_ascii=False)
+    return json.dumps({"version":"0.4.1","exported_at":datetime.utcnow().isoformat()+"Z","tasks":[asdict(t) for t in tasks]}, indent=2, ensure_ascii=False)
 
 def tasks_from_json(data: str) -> List[Task]:
     payload = json.loads(data); rows = payload if isinstance(payload, list) else payload.get("tasks", [])

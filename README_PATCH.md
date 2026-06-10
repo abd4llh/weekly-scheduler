@@ -1,22 +1,19 @@
-# v0.7.0 AI parser patch
+# Weekly Scheduler v0.8.0 patch
 
-Replace these files in the repository root:
+Replace these files in the repo root:
 
-- `ai_parser.py`
 - `models.py`
-- `requirements.txt`
+- `ai_parser.py`
 
-Then add the import/button changes to `app.py` manually, or ask ChatGPT to apply the app patch next.
+This adds:
 
-Streamlit secrets:
+- AI-first task parsing for bullets and paragraphs
+- generic consistency validation
+- one AI self-repair pass
+- confidence / assumptions / clarification fields
+
+Your Streamlit secrets still need:
 
 ```toml
 OPENAI_API_KEY = "sk-..."
-```
-
-The AI parser function is:
-
-```python
-from ai_parser import parse_tasks_with_ai
-tasks, warnings = parse_tasks_with_ai(raw_text, api_key, model="gpt-4.1-mini")
 ```

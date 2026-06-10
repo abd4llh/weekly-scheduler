@@ -1,4 +1,5 @@
 import json
+import re
 from openai import OpenAI
 from models import Task, CATEGORIES, DAY_NAMES
 
@@ -9,24 +10,66 @@ ENERGIES = ["High", "Medium", "Low", "Physical", "Creative"]
 LOCATIONS = ["Lab", "Home", "Gym", "Any"]
 
 SYSTEM_PROMPT = """
-You are an expert task parser for a weekly scheduling app.
-Convert messy task lists into structured scheduling tasks.
+You are an AI task-understanding agent for a weekly scheduling app.
+
+Input may be bullets, messy notes, paragraphs, or mixed text.
+Your job is to extract ALL actionable tasks and convert them into structured scheduling objects.
+Do not rely only on keywords. Interpret the meaning of the task in context.
 
 Return ONLY valid JSON:
-{"tasks":[{"title":"","duration_min":60,"priority":"Medium","task_type":"Flexible","sessions_per_week":1,"fixed_day":"","fixed_start":"","preferred_time":"Any","energy":"Medium","location":"Any","splittable":true,"min_block_min":30,"max_block_min":180,"can_overlap":false,"category":"Other","notes":""}],"warnings":[]}
+{
+  "tasks": [
+    {
+      "title": "short clean title",
+      "duration_min": 60,
+      "priority": "Critical|High|Medium|Low|Optional",
+      "task_type": "Fixed|Flexible|Recurring|Multi-session",
+      "sessions_per_week": 1,
+      "fixed_day": "",
+      "fixed_start": "",
+      "preferred_time": "Morning|Workday|Afternoon|Evening|Weekend|Any",
+      "energy": "High|Medium|Low|Physical|Creative",
+      "location": "Lab|Home|Gym|Any",
+      "splittable": true,
+      "min_block_min": 30,
+      "max_block_min": 180,
+      "can_overlap": false,
+      "category": "Work|Lab|Writing|Admin|Health|Home|Relationship|Social|Learning|Optional|Focus|Other",
+      "notes": "original text or paraphrase",
+      "confidence": 0.85,
+      "duration_is_estimated": true,
+      "assumptions": "brief assumptions made",
+      "needs_clarification": false,
+      "clarification_question": ""
+    }
+  ],
+  "warnings": []
+}
 
-Rules:
-- Fixed appointments need fixed_day and fixed_start in HH:MM.
-- Emails, booking, short messages, and sending papers are Admin, Low energy, 10-30 min blocks.
-- Lab experiments are Lab, High energy, min_block_min at least 90, max_block_min 180.
-- Paper preparation/writing is Writing, High energy, min_block_min at least 90.
-- Gym is Health, Physical, recurring if frequency is given.
-- Cooking/laundry/groceries/cleaning/cabinets are Home.
-- Talking with wife/partner is Relationship and can_overlap=true if text says it can be done alongside low mental load tasks.
-- Raspberry Pi and Udemy/personal development are Optional unless the user says otherwise.
-- "around 10 hours" means duration_min=600.
-- "1 hour per cabinet" and 4 cabinets means duration_min=60, sessions_per_week=4, task_type="Multi-session".
-- Do not invent deadlines.
+Scheduling ontology:
+- Fixed: exact day and exact time are provided.
+- Recurring: repeats daily, weekly, several times per week, every morning/evening, etc.
+- Multi-session: total work should be split into multiple useful blocks.
+- Flexible: one task that can be scheduled once wherever it fits.
+
+General principles:
+- If exact day and time are provided, use task_type="Fixed".
+- If a task repeats, use task_type="Recurring" and sessions_per_week > 1.
+- If total work is large and can be split, use task_type="Multi-session".
+- If duration is missing, estimate conservatively and set duration_is_estimated=true.
+- If duration is explicit, set duration_is_estimated=false.
+- Choose a realistic minimum block size based on the task context.
+- Tasks requiring setup/context should not have tiny blocks.
+- Admin micro-tasks can have 10–30 minute blocks.
+- Only set can_overlap=true when the text or task nature clearly supports low-attention overlap.
+- If you are unsure, set confidence lower and write an assumption.
+- If the missing information prevents good scheduling, set needs_clarification=true and ask a concise clarification question.
+"""
+
+REPAIR_PROMPT = """
+You previously returned structured tasks, but the validator found consistency problems.
+Repair the JSON while preserving the user's intent. Do not add new tasks unless one was clearly missed.
+Return ONLY valid JSON with the same shape: {"tasks": [...], "warnings": [...]}.
 """
 
 def _pick(value, allowed, default):
@@ -42,6 +85,13 @@ def _to_int(value, default, lo=None, hi=None):
     if hi is not None:
         out = min(hi, out)
     return out
+
+def _to_float(value, default=0.8):
+    try:
+        out = float(value)
+    except Exception:
+        out = default
+    return max(0.0, min(1.0, out))
 
 def _to_bool(value, default=False):
     if isinstance(value, bool):
@@ -60,7 +110,6 @@ def _task_from_dict(item):
         fixed_day = ""
 
     fixed_start = str(item.get("fixed_start") or "").strip()
-    import re
     if fixed_start and not re.match(r"^\d{2}:\d{2}$", fixed_start):
         fixed_start = ""
 
@@ -81,22 +130,116 @@ def _task_from_dict(item):
         can_overlap=_to_bool(item.get("can_overlap"), False),
         notes=str(item.get("notes") or item.get("title") or ""),
         category=_pick(item.get("category"), CATEGORIES, "Other"),
+        confidence=_to_float(item.get("confidence"), 0.8),
+        duration_is_estimated=_to_bool(item.get("duration_is_estimated"), True),
+        assumptions=str(item.get("assumptions") or ""),
+        needs_clarification=_to_bool(item.get("needs_clarification"), False),
+        clarification_question=str(item.get("clarification_question") or ""),
     )
 
-def parse_tasks_with_ai(raw_text: str, api_key: str, model: str = "gpt-4.1-mini"):
-    if not api_key:
-        raise ValueError("Missing OpenAI API key.")
-    client = OpenAI(api_key=api_key)
+def _tasks_to_payload(tasks, warnings=None):
+    return {
+        "tasks": [
+            {
+                "title": t.title,
+                "duration_min": t.duration_min,
+                "priority": t.priority,
+                "task_type": t.task_type,
+                "sessions_per_week": t.sessions_per_week,
+                "fixed_day": t.fixed_day,
+                "fixed_start": t.fixed_start,
+                "preferred_time": t.preferred_time,
+                "energy": t.energy,
+                "location": t.location,
+                "splittable": t.splittable,
+                "min_block_min": t.min_block_min,
+                "max_block_min": t.max_block_min,
+                "can_overlap": t.can_overlap,
+                "category": t.category,
+                "notes": t.notes,
+                "confidence": t.confidence,
+                "duration_is_estimated": t.duration_is_estimated,
+                "assumptions": t.assumptions,
+                "needs_clarification": t.needs_clarification,
+                "clarification_question": t.clarification_question,
+            }
+            for t in tasks
+        ],
+        "warnings": warnings or [],
+    }
+
+def validate_ai_tasks(tasks):
+    issues = []
+    for i, t in enumerate(tasks):
+        label = f"Task {i+1} ({t.title})"
+        if t.fixed_day and t.fixed_start and t.task_type != "Fixed":
+            issues.append(f"{label}: has fixed_day and fixed_start but task_type is {t.task_type}; usually this should be Fixed.")
+        if t.task_type == "Fixed" and (not t.fixed_day or not t.fixed_start):
+            issues.append(f"{label}: task_type is Fixed but fixed_day or fixed_start is missing.")
+        if t.sessions_per_week > 1 and t.task_type == "Flexible":
+            issues.append(f"{label}: sessions_per_week > 1 but task_type is Flexible; usually Recurring or Multi-session is more consistent.")
+        if t.task_type == "Recurring" and t.sessions_per_week <= 1:
+            issues.append(f"{label}: task_type is Recurring but sessions_per_week is not greater than 1.")
+        if t.min_block_min > t.max_block_min:
+            issues.append(f"{label}: min_block_min is greater than max_block_min.")
+        if t.max_block_min > t.duration_min and t.task_type != "Recurring":
+            issues.append(f"{label}: max_block_min is greater than duration_min for a non-recurring task.")
+        if t.can_overlap and not t.assumptions:
+            issues.append(f"{label}: can_overlap is true but no assumption/explanation is provided.")
+        if t.confidence < 0.45 and not t.needs_clarification:
+            issues.append(f"{label}: confidence is low but needs_clarification is false.")
+    return issues
+
+def _call_ai(client, model, messages):
     response = client.chat.completions.create(
         model=model,
         temperature=0,
         response_format={"type": "json_object"},
-        messages=[
+        messages=messages,
+    )
+    return json.loads(response.choices[0].message.content)
+
+def parse_tasks_with_ai(raw_text: str, api_key: str, model: str = "gpt-4.1-mini", repair_passes: int = 1):
+    if not api_key:
+        raise ValueError("Missing OpenAI API key.")
+
+    client = OpenAI(api_key=api_key)
+
+    data = _call_ai(
+        client,
+        model,
+        [
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": raw_text},
         ],
     )
-    data = json.loads(response.choices[0].message.content)
+
     tasks = [_task_from_dict(item) for item in data.get("tasks", [])]
-    warnings = data.get("warnings", [])
+    warnings = list(data.get("warnings", []))
+    issues = validate_ai_tasks(tasks)
+
+    for _ in range(repair_passes):
+        if not issues:
+            break
+        repair_input = {
+            "original_user_text": raw_text,
+            "current_json": _tasks_to_payload(tasks, warnings),
+            "validation_issues": issues,
+        }
+        data = _call_ai(
+            client,
+            model,
+            [
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "system", "content": REPAIR_PROMPT},
+                {"role": "user", "content": json.dumps(repair_input, ensure_ascii=False)},
+            ],
+        )
+        tasks = [_task_from_dict(item) for item in data.get("tasks", [])]
+        warnings = list(data.get("warnings", []))
+        issues = validate_ai_tasks(tasks)
+
+    if issues:
+        warnings.extend(issues)
+
     return tasks, warnings

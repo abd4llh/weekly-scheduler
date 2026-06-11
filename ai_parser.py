@@ -14,6 +14,8 @@ You are an AI task-understanding agent for a public weekly scheduling app.
 
 Input may be bullets, notes, paragraphs, or mixed text. Extract ALL actionable tasks and convert them into structured scheduling objects. Do not rely only on keywords. Interpret the meaning of each task in context.
 
+Every distinct action or routine mentioned by the user should become its own task. Do not omit daily routines, fixed appointments, social events, household tasks, or repeated habits.
+
 Return ONLY valid JSON:
 {
   "tasks": [
@@ -51,10 +53,11 @@ Scheduling ontology:
 - Flexible: one task that can be scheduled once wherever it fits.
 
 Important duration semantics:
-- For Multi-session tasks, duration_min MUST mean the TOTAL duration needed for the week, not duration per session.
-- sessions_per_week for a Multi-session task is only a suggested number of pieces and must not multiply the total duration.
-- If the user says "10 hours of work this week", use duration_min=600, not 600 per session.
-- If the user says "5 hours of writing this week", use duration_min=300, not 300 per session.
+- For Recurring tasks, duration_min MUST mean duration per occurrence/session.
+- For Multi-session tasks, duration_min MUST mean total duration needed for the week, not duration per session.
+- sessions_per_week is a count, not a duration multiplier.
+- If the user says "10 hours of work this week", use duration_min=600 and task_type="Multi-session".
+- If the user says "5 hours of writing this week", use duration_min=300 and task_type="Multi-session".
 
 General principles:
 - If exact day and time are provided, use task_type="Fixed".
@@ -63,8 +66,10 @@ General principles:
 - If duration is missing, estimate conservatively and set duration_is_estimated=true.
 - If duration is explicit, set duration_is_estimated=false.
 - For exercise with no explicit duration, estimate 60-120 minutes, not 180+ minutes.
-- For daily cooking or meal preparation with no explicit duration, estimate 45-90 minutes and prefer Evening unless the user says otherwise.
-- For relationship or social calls with no explicit duration, estimate 30-90 minutes and prefer Evening unless the user says otherwise.
+- For daily cooking or meal preparation with no explicit duration, estimate 45-90 minutes and set preferred_time="Evening" unless the user says otherwise.
+- For relationship or social calls with no explicit duration, estimate 30-90 minutes and set preferred_time="Evening" unless the user says otherwise.
+- For relationship/social calls, can_overlap should be false unless the user explicitly says the call can happen alongside another activity.
+- Fixed social events should be treated as non-overlapping fixed events.
 - Choose a realistic minimum block size based on the task context.
 - Tasks requiring setup/context should not have tiny blocks.
 - Admin micro-tasks can have 10-30 minute blocks.
@@ -105,6 +110,38 @@ def _to_bool(value, default=False):
         return value.strip().lower() in ["true", "yes", "1"]
     return default
 
+def _postprocess_task(task):
+    text = f"{task.title} {task.notes} {task.assumptions}".lower()
+
+    if task.task_type == "Recurring" and task.duration_is_estimated:
+        if task.category == "Health" or task.energy == "Physical":
+            if task.duration_min > 120:
+                task.duration_min = 90
+            elif task.duration_min < 45:
+                task.duration_min = 60
+        elif task.category == "Home":
+            if task.duration_min > 120:
+                task.duration_min = 75
+            elif task.duration_min < 30:
+                task.duration_min = 45
+        elif task.category in ["Relationship", "Social"]:
+            if task.duration_min > 120:
+                task.duration_min = 60
+            elif task.duration_min < 20:
+                task.duration_min = 30
+
+    if task.task_type == "Recurring" and task.category in ["Home", "Relationship", "Social"] and task.preferred_time == "Any":
+        task.preferred_time = "Evening"
+
+    if task.category in ["Relationship", "Social"] and task.can_overlap:
+        overlap_words = ["overlap", "alongside", "at the same time", "while", "simultaneously", "passive", "low attention"]
+        if not any(word in text for word in overlap_words):
+            task.can_overlap = False
+
+    task.min_block_min = min(int(task.min_block_min), int(task.duration_min))
+    task.max_block_min = min(max(int(task.max_block_min), int(task.min_block_min)), int(task.duration_min))
+    return task
+
 def _task_from_dict(item):
     duration = _to_int(item.get("duration_min"), 60, 1, 1440)
     min_block = _to_int(item.get("min_block_min"), min(30, duration), 1, duration)
@@ -118,7 +155,7 @@ def _task_from_dict(item):
     if fixed_start and not re.match(r"^\d{2}:\d{2}$", fixed_start):
         fixed_start = ""
 
-    return Task(
+    task = Task(
         title=str(item.get("title") or "Untitled task")[:120],
         duration_min=duration,
         priority=_pick(item.get("priority"), PRIORITIES, "Medium"),
@@ -141,6 +178,7 @@ def _task_from_dict(item):
         needs_clarification=_to_bool(item.get("needs_clarification"), False),
         clarification_question=str(item.get("clarification_question") or ""),
     )
+    return _postprocess_task(task)
 
 def _tasks_to_payload(tasks, warnings=None):
     return {"tasks": [t.__dict__ for t in tasks], "warnings": warnings or []}
@@ -161,6 +199,8 @@ def validate_ai_tasks(tasks):
             issues.append(f"{label}: min_block_min is greater than max_block_min.")
         if t.max_block_min > t.duration_min and t.task_type != "Recurring":
             issues.append(f"{label}: max_block_min is greater than duration_min for a non-recurring task.")
+        if t.task_type == "Recurring" and t.duration_is_estimated and t.duration_min > 180:
+            issues.append(f"{label}: estimated recurring duration is unusually long; use a per-session duration, not weekly total.")
         if t.can_overlap and not t.assumptions:
             issues.append(f"{label}: can_overlap is true but no assumption/explanation is provided.")
         if t.confidence < 0.45 and not t.needs_clarification:

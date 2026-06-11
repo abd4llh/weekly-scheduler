@@ -10,7 +10,7 @@ ENERGIES = ["High", "Medium", "Low", "Physical", "Creative"]
 LOCATIONS = ["Lab", "Home", "Gym", "Any"]
 
 SYSTEM_PROMPT = """
-You are an AI task-understanding agent for a public weekly scheduling app.
+You are an AI task-understanding and planning-constraint extraction agent for a public weekly scheduling app.
 
 Input may be bullets, notes, paragraphs, or mixed text. Extract ALL actionable tasks and convert them into structured scheduling objects. Do not rely only on keywords. Interpret the meaning of each task in context.
 
@@ -35,6 +35,12 @@ Return ONLY valid JSON:
       "max_block_min": 180,
       "can_overlap": false,
       "category": "Work|Lab|Writing|Admin|Health|Home|Relationship|Social|Learning|Optional|Focus|Other",
+      "required_day": "",
+      "earliest_day": "",
+      "deadline_day": "",
+      "deadline_time": "",
+      "depends_on": "",
+      "phase": 0,
       "notes": "original text or paraphrase",
       "confidence": 0.85,
       "duration_is_estimated": true,
@@ -52,6 +58,13 @@ Scheduling ontology:
 - Multi-session: total work should be split into multiple useful blocks.
 - Flexible: one task that can be scheduled once wherever it fits.
 
+Planning constraints:
+- required_day: use when the user specifies a day but not an exact time, e.g. "Sunday afternoon", "Tuesday morning", "on Friday".
+- earliest_day: use when a task should not begin before a day, e.g. "after Wednesday", "once supplies arrive Tuesday".
+- deadline_day/deadline_time: use for constraints like "before Friday evening", "by Thursday", "before 18:00". Use deadline_time as HH:MM when possible.
+- depends_on: use when a task logically depends on another task being done first, e.g. varnishing/packing after painting, editing after drafting, delivery after preparation. Put the clean title of the prerequisite task.
+- phase: rough order group. Use 1 for main/prep work, 2 for follow-up/finishing, 3 for delivery/export/review. Keep 0 if no order is implied.
+
 Important duration semantics:
 - For Recurring tasks, duration_min MUST mean duration per occurrence/session.
 - For Multi-session tasks, duration_min MUST mean total duration needed for the week, not duration per session.
@@ -61,6 +74,8 @@ Important duration semantics:
 
 General principles:
 - If exact day and time are provided, use task_type="Fixed".
+- If a day is provided without an exact time, do NOT invent a fixed_start. Use required_day and preferred_time instead.
+- If a deadline is provided without an exact event time, use deadline_day/deadline_time instead of task_type="Fixed".
 - If a task repeats, use task_type="Recurring" and sessions_per_week > 1.
 - If total work is large and can be split, use task_type="Multi-session".
 - If duration is missing, estimate conservatively and set duration_is_estimated=true.
@@ -84,6 +99,14 @@ You previously returned structured tasks, but the validator found consistency pr
 
 def _pick(value, allowed, default):
     return value if value in allowed else default
+
+def _clean_day(value):
+    value = str(value or "").strip()
+    return value if value in DAY_NAMES else ""
+
+def _clean_hhmm(value):
+    value = str(value or "").strip()
+    return value if re.match(r"^\d{2}:\d{2}$", value) else ""
 
 def _to_int(value, default, lo=None, hi=None):
     try:
@@ -138,6 +161,20 @@ def _postprocess_task(task):
         if not any(word in text for word in overlap_words):
             task.can_overlap = False
 
+    # If AI invented a fixed time for a soft day phrase, keep it as a day constraint instead.
+    soft_day_words = ["morning", "afternoon", "evening", "before", "by", "sometime"]
+    if task.task_type == "Fixed" and task.fixed_day and not task.fixed_start:
+        task.required_day = task.fixed_day
+        task.fixed_day = ""
+        task.task_type = "Flexible"
+    if task.task_type == "Fixed" and task.fixed_day and task.fixed_start and any(word in text for word in soft_day_words):
+        # Only demote if the note does not contain an explicit clock-time phrase.
+        if not re.search(r"\b\d{1,2}:\d{2}\b", text):
+            task.required_day = task.fixed_day
+            task.fixed_day = ""
+            task.fixed_start = ""
+            task.task_type = "Flexible"
+
     task.min_block_min = min(int(task.min_block_min), int(task.duration_min))
     task.max_block_min = min(max(int(task.max_block_min), int(task.min_block_min)), int(task.duration_min))
     return task
@@ -147,22 +184,14 @@ def _task_from_dict(item):
     min_block = _to_int(item.get("min_block_min"), min(30, duration), 1, duration)
     max_block = _to_int(item.get("max_block_min"), max(min_block, min(duration, 180)), min_block, 1440)
 
-    fixed_day = item.get("fixed_day") or ""
-    if fixed_day not in DAY_NAMES:
-        fixed_day = ""
-
-    fixed_start = str(item.get("fixed_start") or "").strip()
-    if fixed_start and not re.match(r"^\d{2}:\d{2}$", fixed_start):
-        fixed_start = ""
-
     task = Task(
         title=str(item.get("title") or "Untitled task")[:120],
         duration_min=duration,
         priority=_pick(item.get("priority"), PRIORITIES, "Medium"),
         task_type=_pick(item.get("task_type"), TASK_TYPES, "Flexible"),
         sessions_per_week=_to_int(item.get("sessions_per_week"), 1, 1, 7),
-        fixed_day=fixed_day,
-        fixed_start=fixed_start,
+        fixed_day=_clean_day(item.get("fixed_day")),
+        fixed_start=_clean_hhmm(item.get("fixed_start")),
         preferred_time=_pick(item.get("preferred_time"), PREFERRED_TIMES, "Any"),
         energy=_pick(item.get("energy"), ENERGIES, "Medium"),
         location=_pick(item.get("location"), LOCATIONS, "Any"),
@@ -172,6 +201,12 @@ def _task_from_dict(item):
         can_overlap=_to_bool(item.get("can_overlap"), False),
         notes=str(item.get("notes") or item.get("title") or ""),
         category=_pick(item.get("category"), CATEGORIES, "Other"),
+        required_day=_clean_day(item.get("required_day")),
+        earliest_day=_clean_day(item.get("earliest_day")),
+        deadline_day=_clean_day(item.get("deadline_day")),
+        deadline_time=_clean_hhmm(item.get("deadline_time")),
+        depends_on=str(item.get("depends_on") or "").strip(),
+        phase=_to_int(item.get("phase"), 0, 0, 9),
         confidence=_to_float(item.get("confidence"), 0.8),
         duration_is_estimated=_to_bool(item.get("duration_is_estimated"), True),
         assumptions=str(item.get("assumptions") or ""),
@@ -185,6 +220,7 @@ def _tasks_to_payload(tasks, warnings=None):
 
 def validate_ai_tasks(tasks):
     issues = []
+    titles = {t.title for t in tasks}
     for i, t in enumerate(tasks):
         label = f"Task {i + 1} ({t.title})"
         if t.fixed_day and t.fixed_start and t.task_type != "Fixed":
@@ -201,6 +237,8 @@ def validate_ai_tasks(tasks):
             issues.append(f"{label}: max_block_min is greater than duration_min for a non-recurring task.")
         if t.task_type == "Recurring" and t.duration_is_estimated and t.duration_min > 180:
             issues.append(f"{label}: estimated recurring duration is unusually long; use a per-session duration, not weekly total.")
+        if t.depends_on and t.depends_on not in titles:
+            issues.append(f"{label}: depends_on references '{t.depends_on}', which does not exactly match another task title.")
         if t.can_overlap and not t.assumptions:
             issues.append(f"{label}: can_overlap is true but no assumption/explanation is provided.")
         if t.confidence < 0.45 and not t.needs_clarification:

@@ -29,7 +29,7 @@ div[data-testid="stMetric"] {border: 1px solid #e5e7eb; border-radius: 14px; pad
 </style>
 <div class="clean-hero">
   <div class="hero-title">Weekly Scheduler</div>
-  <div class="hero-sub">AI-first task parsing, planning modes, editable assumptions, and realistic workload signals.</div>
+  <div class="hero-sub">Paste your tasks, let AI structure them, then generate a realistic weekly plan.</div>
 </div>
 """,
     unsafe_allow_html=True,
@@ -48,26 +48,6 @@ def clear_generated_schedule():
         st.session_state.pop(key, None)
 
 
-def user_defaults_from_sidebar():
-    with st.sidebar.expander("Default assumptions", expanded=False):
-        focused_work = st.number_input("Focused work block", min_value=15, max_value=240, value=90, step=15)
-        lab_block = st.number_input("Lab / experiment block", min_value=30, max_value=300, value=120, step=15)
-        writing_block = st.number_input("Writing block", min_value=30, max_value=240, value=90, step=15)
-        admin_block = st.number_input("Admin micro-task", min_value=5, max_value=60, value=20, step=5)
-        exercise_duration = st.number_input("Exercise session", min_value=15, max_value=240, value=90, step=15)
-        cooking_duration = st.number_input("Cooking / meal prep", min_value=15, max_value=240, value=60, step=15)
-        relationship_duration = st.number_input("Relationship / social call", min_value=15, max_value=240, value=60, step=15)
-    return {
-        "focused_work_block_min": int(focused_work),
-        "lab_experiment_block_min": int(lab_block),
-        "writing_block_min": int(writing_block),
-        "admin_micro_task_min": int(admin_block),
-        "exercise_session_min": int(exercise_duration),
-        "cooking_or_meal_prep_min": int(cooking_duration),
-        "relationship_or_social_call_min": int(relationship_duration),
-    }
-
-
 with st.sidebar:
     st.header("Plan settings")
     st.caption(APP_VERSION)
@@ -79,8 +59,6 @@ with st.sidebar:
     )
     protect_weekend = st.checkbox("Protect weekend from heavy work", value=True)
     include_focus_guard = st.checkbox("Add Focus Guard / transition blocks", value=False)
-    st.divider()
-    defaults = user_defaults_from_sidebar()
     st.divider()
     st.header("Day settings")
     wake_time = st.time_input("Wake time", value=time(6, 0))
@@ -205,19 +183,14 @@ def render_plan_health(summary, planning_mode):
         st.success(text)
 
 
-def assumptions_dataframe(tasks):
+def visible_task_dataframe(tasks):
+    hidden_cols = {"confidence", "duration_is_estimated", "assumptions", "needs_clarification", "clarification_question"}
     rows = []
     for task in tasks:
-        rows.append(
-            {
-                "Task": task.title,
-                "Confidence": round(float(getattr(task, "confidence", 0.8)), 2),
-                "Duration estimated": bool(getattr(task, "duration_is_estimated", True)),
-                "Assumptions": getattr(task, "assumptions", ""),
-                "Needs clarification": bool(getattr(task, "needs_clarification", False)),
-                "Clarification question": getattr(task, "clarification_question", ""),
-            }
-        )
+        row = asdict(task)
+        for col in hidden_cols:
+            row.pop(col, None)
+        rows.append(row)
     return pd.DataFrame(rows)
 
 
@@ -225,7 +198,7 @@ tab_calendar, tab_tasks, tab_issues, tab_table = st.tabs(["Calendar", "Tasks", "
 
 with tab_tasks:
     st.subheader("Task input")
-    st.caption("Paste tasks as bullet points, notes, or a paragraph. The app uses AI to extract a structured task table.")
+    st.caption("Paste tasks as bullet points, notes, or a paragraph.")
     raw = st.text_area(
         "Task list",
         height=320,
@@ -250,12 +223,12 @@ with tab_tasks:
             else:
                 with st.spinner("AI is parsing your task list..."):
                     try:
-                        ai_tasks, ai_warnings = parse_tasks_with_ai(st.session_state.raw_task_text, api_key, model=ai_model, user_defaults=defaults)
+                        ai_tasks, ai_warnings = parse_tasks_with_ai(st.session_state.raw_task_text, api_key, model=ai_model)
                         st.session_state.parsed_tasks = normalize_task_categories(ai_tasks)
                         st.session_state.ai_warnings = ai_warnings
                         st.session_state.editor_version += 1
                         clear_generated_schedule()
-                        st.success("AI parsing complete. Review the table below.")
+                        st.success("Tasks parsed. Review the table below.")
                         st.rerun()
                     except Exception as exc:
                         st.error(f"AI parsing failed: {exc}")
@@ -272,7 +245,7 @@ with tab_tasks:
                 st.error(f"Could not load JSON: {exc}")
 
     if st.session_state.ai_warnings:
-        with st.expander("AI parser warnings", expanded=True):
+        with st.expander("Items to review", expanded=True):
             for warning in st.session_state.ai_warnings:
                 st.warning(str(warning))
 
@@ -281,8 +254,9 @@ with tab_tasks:
         st.info("No parsed tasks yet. Paste tasks above and click Parse tasks with AI.")
         edited_df = pd.DataFrame(columns=[field for field in Task.__dataclass_fields__])
     else:
+        visible_df = visible_task_dataframe(st.session_state.parsed_tasks)
         edited_df = st.data_editor(
-            pd.DataFrame([asdict(task) for task in st.session_state.parsed_tasks]),
+            visible_df,
             num_rows="dynamic",
             use_container_width=True,
             height=430,
@@ -299,10 +273,6 @@ with tab_tasks:
         )
 
     tasks = df_to_tasks(edited_df)
-
-    if tasks:
-        with st.expander("AI assumptions", expanded=True):
-            st.dataframe(assumptions_dataframe(tasks), use_container_width=True, hide_index=True)
 
     b1, b2 = st.columns([1.4, 1.2])
     with b1:

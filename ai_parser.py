@@ -50,12 +50,21 @@ Scheduling ontology:
 - Multi-session: total work should be split into multiple useful blocks.
 - Flexible: one task that can be scheduled once wherever it fits.
 
+Important duration semantics:
+- For Multi-session tasks, duration_min MUST mean the TOTAL duration needed for the week, not duration per session.
+- sessions_per_week for a Multi-session task is only a suggested number of pieces and must not multiply the total duration.
+- If the user says "10 hours of work this week", use duration_min=600, not 600 per session.
+- If the user says "5 hours of writing this week", use duration_min=300, not 300 per session.
+
 General principles:
 - If exact day and time are provided, use task_type="Fixed".
 - If a task repeats, use task_type="Recurring" and sessions_per_week > 1.
 - If total work is large and can be split, use task_type="Multi-session".
-- If duration is missing, estimate conservatively using the provided user defaults and set duration_is_estimated=true.
+- If duration is missing, estimate conservatively and set duration_is_estimated=true.
 - If duration is explicit, set duration_is_estimated=false.
+- For exercise with no explicit duration, estimate 60-120 minutes, not 180+ minutes.
+- For daily cooking or meal preparation with no explicit duration, estimate 45-90 minutes and prefer Evening unless the user says otherwise.
+- For relationship or social calls with no explicit duration, estimate 30-90 minutes and prefer Evening unless the user says otherwise.
 - Choose a realistic minimum block size based on the task context.
 - Tasks requiring setup/context should not have tiny blocks.
 - Admin micro-tasks can have 10-30 minute blocks.
@@ -171,8 +180,7 @@ def parse_tasks_with_ai(raw_text: str, api_key: str, model: str = "gpt-4.1-mini"
     if not api_key:
         raise ValueError("Missing OpenAI API key.")
 
-    defaults_text = json.dumps(user_defaults or {}, ensure_ascii=False, indent=2)
-    user_message = f"User defaults for missing/estimated values:\n{defaults_text}\n\nRaw task text:\n{raw_text}"
+    user_message = f"Raw task text:\n{raw_text}"
 
     client = OpenAI(api_key=api_key)
     data = _call_ai(client, model, [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": user_message}])
@@ -183,7 +191,7 @@ def parse_tasks_with_ai(raw_text: str, api_key: str, model: str = "gpt-4.1-mini"
     for _ in range(repair_passes):
         if not issues:
             break
-        repair_input = {"original_user_text": raw_text, "user_defaults": user_defaults or {}, "current_json": _tasks_to_payload(tasks, warnings), "validation_issues": issues}
+        repair_input = {"original_user_text": raw_text, "current_json": _tasks_to_payload(tasks, warnings), "validation_issues": issues}
         data = _call_ai(client, model, [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "system", "content": REPAIR_PROMPT}, {"role": "user", "content": json.dumps(repair_input, ensure_ascii=False)}])
         tasks = [_task_from_dict(item) for item in data.get("tasks", [])]
         warnings = list(data.get("warnings", []))

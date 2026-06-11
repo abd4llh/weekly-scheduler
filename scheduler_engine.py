@@ -102,6 +102,10 @@ class Scheduler:
             score += 14
         if task.category in ["Home", "Social", "Optional"] and day in [5, 6]:
             score += 12
+        if task.category == "Home" and start < 1020:
+            score -= 45
+        if task.category in ["Relationship", "Social"] and 1140 <= start <= 1260:
+            score += 35
         if task.priority == "Optional":
             score -= 40
         if day == 5:
@@ -177,20 +181,22 @@ class Scheduler:
         if task.category == "Health" or task.energy == "Physical":
             start = self.wake_min + 30
             return [(start, start + duration)]
-        if task.category == "Relationship":
-            end = min(self.sleep_min - 30, 1350)
+        if task.category in ["Relationship", "Social"]:
+            preferred_start = 1140
+            if task.preferred_time == "Evening":
+                preferred_start = 1170
+            end = min(preferred_start + duration, min(self.sleep_min - 60, 1290))
             start = max(self.wake_min, end - duration)
             return [(start, end)]
-        if task.category == "Home" and task.preferred_time == "Evening":
+        if task.category == "Home":
             start = 1080
             return [(start, start + duration)]
         if task.preferred_time == "Morning":
             start = self.wake_min + 15
             return [(start, start + duration)]
         if task.preferred_time == "Evening":
-            end = min(self.sleep_min - 30, 1350)
-            start = max(self.wake_min, end - duration)
-            return [(start, end)]
+            start = 1080
+            return [(start, start + duration)]
         return []
 
     def schedule_recurring(self, task):
@@ -218,7 +224,7 @@ class Scheduler:
     def schedule_flex(self, task):
         if task.priority == "Optional" and any(item.priority in ["Critical", "High"] for item in self.unscheduled):
             return self.add_unscheduled(task, "Skipped optional task because high-priority work is already unscheduled.")
-        total = int(task.duration_min) * int(task.sessions_per_week) if task.task_type == "Multi-session" else int(task.duration_min)
+        total = int(task.duration_min)
         remaining = total
         scheduled = 0
         while remaining > 0:

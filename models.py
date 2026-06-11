@@ -8,7 +8,7 @@ PRIORITY_SCORE = {"Critical": 4, "High": 3, "Medium": 2, "Low": 1, "Optional": 0
 ENERGY_SCORE = {"High": 3, "Medium": 2, "Physical": 2, "Creative": 2, "Low": 1}
 CATEGORIES = ["Work", "Lab", "Writing", "Admin", "Health", "Home", "Relationship", "Social", "Learning", "Optional", "Focus", "Other"]
 PLANNING_MODES = ["Balanced week", "Work-heavy week", "Recovery week", "Deadline mode", "Social weekend mode"]
-APP_VERSION = "Weekly Scheduler v0.8.4 — duration and recurrence fix"
+APP_VERSION = "Weekly Scheduler v0.9.0 — AI planning constraints"
 
 @dataclass
 class Task:
@@ -28,6 +28,12 @@ class Task:
     can_overlap: bool = False
     notes: str = ""
     category: str = "Other"
+    required_day: str = ""
+    earliest_day: str = ""
+    deadline_day: str = ""
+    deadline_time: str = ""
+    depends_on: str = ""
+    phase: int = 0
     confidence: float = 0.8
     duration_is_estimated: bool = True
     assumptions: str = ""

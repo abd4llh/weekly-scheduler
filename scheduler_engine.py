@@ -1,4 +1,4 @@
-from models import DAY_NAMES, PRIORITY_SCORE, ENERGY_SCORE, Event, UnscheduledTask
+from models import DAY_NAMES, DAY_TO_INDEX, PRIORITY_SCORE, ENERGY_SCORE, Event, UnscheduledTask
 from parser_utils import hhmm_to_minutes, minutes_to_hhmm
 
 
@@ -14,6 +14,7 @@ class Scheduler:
         self.busy = {day: [] for day in range(7)}
         self.flex_load = {day: 0 for day in range(7)}
         self.high_load = {day: 0 for day in range(7)}
+        self.completion = {}
         self.daily_flex_cap = {0: 420, 1: 420, 2: 420, 3: 420, 4: 360, 5: 240, 6: 180}
         self.daily_high_cap = {0: 360, 1: 360, 2: 360, 3: 360, 4: 300, 5: 60, 6: 0}
         self.apply_planning_mode()
@@ -31,6 +32,12 @@ class Scheduler:
         elif self.planning_mode == "Social weekend mode":
             self.daily_flex_cap.update({0: 420, 1: 420, 2: 420, 3: 390, 4: 300, 5: 90, 6: 60})
             self.daily_high_cap.update({0: 360, 1: 360, 2: 360, 3: 300, 4: 180, 5: 0, 6: 0})
+
+    def day_index(self, value):
+        return DAY_TO_INDEX.get(str(value or "").lower())
+
+    def absolute_min(self, day, minute):
+        return day * 1440 + minute
 
     def add_unscheduled(self, task, reason):
         self.unscheduled.append(
@@ -65,7 +72,7 @@ class Scheduler:
             if source_task.energy == "High":
                 self.high_load[event.day_index] += duration
 
-    def windows(self, task):
+    def base_windows(self, task):
         windows = []
         if task.preferred_time == "Morning":
             for day in range(7):
@@ -92,6 +99,34 @@ class Scheduler:
             windows = [(4, 1080, 1200, "optional Friday"), (5, 960, 1140, "optional weekend"), (6, 840, 1020, "optional Sunday")]
         return windows
 
+    def windows(self, task):
+        windows = self.base_windows(task)
+
+        required_day = self.day_index(getattr(task, "required_day", ""))
+        earliest_day = self.day_index(getattr(task, "earliest_day", ""))
+        deadline_day = self.day_index(getattr(task, "deadline_day", ""))
+        deadline_time = hhmm_to_minutes(getattr(task, "deadline_time", "") or "")
+
+        if required_day is not None:
+            windows = [(day, start, end, reason + "; required day") for day, start, end, reason in windows if day == required_day]
+            if not windows:
+                windows = [(required_day, self.wake_min, self.sleep_min, "required day fallback")]
+
+        if earliest_day is not None:
+            windows = [(day, start, end, reason) for day, start, end, reason in windows if day >= earliest_day]
+
+        if deadline_day is not None:
+            cutoff_time = deadline_time if deadline_time is not None else self.sleep_min
+            filtered = []
+            for day, start, end, reason in windows:
+                if day < deadline_day:
+                    filtered.append((day, start, end, reason + "; before deadline"))
+                elif day == deadline_day and start < cutoff_time:
+                    filtered.append((day, start, min(end, cutoff_time), reason + "; before deadline"))
+            windows = filtered
+
+        return [(day, start, end, reason) for day, start, end, reason in windows if end - start >= self.slot_min]
+
     def score_slot(self, task, day, start, end, reason):
         score = 100 + PRIORITY_SCORE.get(task.priority, 2) * 25 + ENERGY_SCORE.get(task.energy, 2) * 5
         if "morning" in reason and task.energy in ["High", "Physical"]:
@@ -106,6 +141,10 @@ class Scheduler:
             score -= 45
         if task.category in ["Relationship", "Social"] and 1140 <= start <= 1260:
             score += 35
+        if "required day" in reason:
+            score += 60
+        if "before deadline" in reason:
+            score += 20
         if task.priority == "Optional":
             score -= 40
         if day == 5:
@@ -125,10 +164,17 @@ class Scheduler:
             score -= 18
         return score
 
-    def find_slot(self, task, duration, preferred_days=None):
+    def find_slot(self, task, duration, preferred_days=None, after_abs=None):
         best = None
         for day, start_window, end_window, reason in self.windows(task):
             start = start_window
+            if after_abs is not None and day * 1440 + start < after_abs:
+                if day * 1440 + end_window <= after_abs:
+                    continue
+                start = max(start, after_abs - day * 1440)
+                remainder = start % self.slot_min
+                if remainder:
+                    start += self.slot_min - remainder
             while start + duration <= end_window:
                 end = start + duration
                 if self.fits_load(day, duration, task) and self.is_free(day, start, end, task.can_overlap):
@@ -137,6 +183,8 @@ class Scheduler:
                         score += 15
                     if best is None or score > best[0]:
                         explanation = f"Best-fit score {score:.0f}: placed on {DAY_NAMES[day]} {minutes_to_hhmm(start)}-{minutes_to_hhmm(end)} because it matches {reason}. Mode: {self.planning_mode}."
+                        if after_abs is not None:
+                            explanation += " Dependency constraint respected."
                         best = (score, day, start, end, explanation)
                 start += self.slot_min
         if best is None:
@@ -152,9 +200,13 @@ class Scheduler:
             if self.is_free(day, start, end):
                 self.add_event(Event(title, day, start, end, "Medium", "Focus Guard", "Protected transition block.", "Focus guard block.", "Focus"))
 
+    def mark_completion(self, task, task_events):
+        if task_events:
+            last = max(self.absolute_min(event.day_index, event.end_min) for event in task_events)
+            self.completion[task.title] = last
+
     def schedule_fixed(self, task):
-        from models import DAY_TO_INDEX
-        day = DAY_TO_INDEX.get(str(task.fixed_day).lower())
+        day = self.day_index(task.fixed_day)
         start = hhmm_to_minutes(str(task.fixed_start))
         if day is None:
             return self.add_unscheduled(task, "Fixed task has no valid day.")
@@ -164,10 +216,15 @@ class Scheduler:
         if not self.is_free(day, start, end, task.can_overlap):
             conflict = "; ".join(f"{title} ({minutes_to_hhmm(s)}-{minutes_to_hhmm(e)})" for s, e, title in self.conflicts(day, start, end))
             return self.add_unscheduled(task, f"Fixed-event conflict with existing event(s): {conflict}.")
-        self.add_event(Event(task.title, day, start, end, task.priority, task.title, task.notes, f"Scheduled as a fixed event on {DAY_NAMES[day]} at {minutes_to_hhmm(start)}.", task.category), task.can_overlap)
+        event = Event(task.title, day, start, end, task.priority, task.title, task.notes, f"Scheduled as a fixed event on {DAY_NAMES[day]} at {minutes_to_hhmm(start)}.", task.category)
+        self.add_event(event, task.can_overlap)
+        self.mark_completion(task, [event])
 
     def recurring_days(self, task):
         sessions = max(1, min(int(task.sessions_per_week), 7))
+        required_day = self.day_index(getattr(task, "required_day", ""))
+        if required_day is not None:
+            return [required_day]
         if sessions == 7:
             return list(range(7))
         if task.category == "Health" or task.energy == "Physical":
@@ -202,6 +259,7 @@ class Scheduler:
     def schedule_recurring(self, task):
         days = self.recurring_days(task)
         count = 0
+        task_events = []
         for day in days:
             placed = False
             for start, end in self.routine_targets(task, day):
@@ -209,34 +267,54 @@ class Scheduler:
                     explanation = "Placed by recurring routine rule."
                     if task.can_overlap:
                         explanation = "Placed as recurring overlapping time because overlap was allowed."
-                    self.add_event(Event(task.title, day, start, end, task.priority, task.title, task.notes, explanation, task.category), task.can_overlap)
+                    event = Event(task.title, day, start, end, task.priority, task.title, task.notes, explanation, task.category)
+                    self.add_event(event, task.can_overlap)
+                    task_events.append(event)
                     placed = True
                     count += 1
                     break
             if not placed:
                 slot = self.find_slot(task, int(task.duration_min), [day])
                 if slot:
-                    self.add_event(Event(task.title, slot[0], slot[1], slot[2], task.priority, task.title, task.notes, slot[3], task.category), task.can_overlap)
+                    event = Event(task.title, slot[0], slot[1], slot[2], task.priority, task.title, task.notes, slot[3], task.category)
+                    self.add_event(event, task.can_overlap)
+                    task_events.append(event)
                     count += 1
         if count < len(days):
             self.add_unscheduled(task, f"Only scheduled {count}/{len(days)} recurring sessions because compatible routine slots were full.")
+        self.mark_completion(task, task_events)
+
+    def dependency_after_abs(self, task):
+        dependency = str(getattr(task, "depends_on", "") or "").strip()
+        if not dependency:
+            return None
+        if dependency in self.completion:
+            return self.completion[dependency]
+        return None
 
     def schedule_flex(self, task):
         if task.priority == "Optional" and any(item.priority in ["Critical", "High"] for item in self.unscheduled):
             return self.add_unscheduled(task, "Skipped optional task because high-priority work is already unscheduled.")
+        if getattr(task, "depends_on", "") and task.depends_on not in self.completion:
+            return self.add_unscheduled(task, f"Dependency '{task.depends_on}' has not been completed or could not be scheduled.")
         total = int(task.duration_min)
         remaining = total
         scheduled = 0
+        task_events = []
+        after_abs = self.dependency_after_abs(task)
         while remaining > 0:
             max_block = min(int(task.max_block_min), remaining)
             min_block = min(int(task.min_block_min), max_block)
             placed = False
             for block in range(max_block, min_block - 1, -15):
-                slot = self.find_slot(task, block)
+                slot = self.find_slot(task, block, after_abs=after_abs)
                 if slot:
-                    self.add_event(Event(task.title, slot[0], slot[1], slot[2], task.priority, task.title, task.notes, slot[3], task.category), task.can_overlap, task)
+                    event = Event(task.title, slot[0], slot[1], slot[2], task.priority, task.title, task.notes, slot[3], task.category)
+                    self.add_event(event, task.can_overlap, task)
+                    task_events.append(event)
                     remaining -= block
                     scheduled += block
+                    after_abs = self.absolute_min(slot[0], slot[2])
                     placed = True
                     break
             if not placed:
@@ -244,18 +322,38 @@ class Scheduler:
         if remaining > 0:
             reason = "high-energy capacity and deep-work windows were already used" if task.energy == "High" else "realistic daily capacity limits were reached"
             self.add_unscheduled(task, f"Scheduled {scheduled}/{total} minutes; {remaining} minutes did not fit because {reason}.")
+        self.mark_completion(task, task_events)
+
+    def order_tasks(self, tasks):
+        remaining = list(tasks)
+        ordered = []
+        titles_done = set()
+        while remaining:
+            progress = False
+            remaining.sort(key=lambda task: (getattr(task, "phase", 0), -PRIORITY_SCORE.get(task.priority, 2), task.title.lower()))
+            for task in list(remaining):
+                dep = str(getattr(task, "depends_on", "") or "").strip()
+                if not dep or dep in titles_done or dep not in [t.title for t in tasks]:
+                    ordered.append(task)
+                    titles_done.add(task.title)
+                    remaining.remove(task)
+                    progress = True
+            if not progress:
+                ordered.extend(remaining)
+                break
+        return ordered
 
     def schedule(self, tasks, include_focus_guard=False):
         if include_focus_guard:
             self.add_focus_guard()
-        for task in tasks:
+        ordered_tasks = self.order_tasks(tasks)
+        for task in ordered_tasks:
             if task.task_type == "Fixed":
                 self.schedule_fixed(task)
-        for task in tasks:
+        for task in ordered_tasks:
             if task.task_type == "Recurring":
                 self.schedule_recurring(task)
-        rest = [task for task in tasks if task.task_type in ["Flexible", "Multi-session"]]
-        rest.sort(key=lambda task: (PRIORITY_SCORE.get(task.priority, 2), ENERGY_SCORE.get(task.energy, 2), task.duration_min), reverse=True)
+        rest = [task for task in ordered_tasks if task.task_type in ["Flexible", "Multi-session"]]
         for task in rest:
             self.schedule_flex(task)
         self.events.sort(key=lambda event: (event.day_index, event.start_min, event.end_min))

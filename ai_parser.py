@@ -10,11 +10,9 @@ ENERGIES = ["High", "Medium", "Low", "Physical", "Creative"]
 LOCATIONS = ["Lab", "Home", "Gym", "Any"]
 
 SYSTEM_PROMPT = """
-You are an AI task-understanding agent for a weekly scheduling app.
+You are an AI task-understanding agent for a public weekly scheduling app.
 
-Input may be bullets, messy notes, paragraphs, or mixed text.
-Your job is to extract ALL actionable tasks and convert them into structured scheduling objects.
-Do not rely only on keywords. Interpret the meaning of the task in context.
+Input may be bullets, notes, paragraphs, or mixed text. Extract ALL actionable tasks and convert them into structured scheduling objects. Do not rely only on keywords. Interpret the meaning of each task in context.
 
 Return ONLY valid JSON:
 {
@@ -56,20 +54,18 @@ General principles:
 - If exact day and time are provided, use task_type="Fixed".
 - If a task repeats, use task_type="Recurring" and sessions_per_week > 1.
 - If total work is large and can be split, use task_type="Multi-session".
-- If duration is missing, estimate conservatively and set duration_is_estimated=true.
+- If duration is missing, estimate conservatively using the provided user defaults and set duration_is_estimated=true.
 - If duration is explicit, set duration_is_estimated=false.
 - Choose a realistic minimum block size based on the task context.
 - Tasks requiring setup/context should not have tiny blocks.
-- Admin micro-tasks can have 10–30 minute blocks.
+- Admin micro-tasks can have 10-30 minute blocks.
 - Only set can_overlap=true when the text or task nature clearly supports low-attention overlap.
 - If you are unsure, set confidence lower and write an assumption.
-- If the missing information prevents good scheduling, set needs_clarification=true and ask a concise clarification question.
+- If missing information prevents good scheduling, set needs_clarification=true and ask a concise clarification question.
 """
 
 REPAIR_PROMPT = """
-You previously returned structured tasks, but the validator found consistency problems.
-Repair the JSON while preserving the user's intent. Do not add new tasks unless one was clearly missed.
-Return ONLY valid JSON with the same shape: {"tasks": [...], "warnings": [...]}.
+You previously returned structured tasks, but the validator found consistency problems. Repair the JSON while preserving the user's intent. Do not add new tasks unless one was clearly missed. Return ONLY valid JSON with the same shape: {"tasks": [...], "warnings": [...]}.
 """
 
 def _pick(value, allowed, default):
@@ -138,40 +134,12 @@ def _task_from_dict(item):
     )
 
 def _tasks_to_payload(tasks, warnings=None):
-    return {
-        "tasks": [
-            {
-                "title": t.title,
-                "duration_min": t.duration_min,
-                "priority": t.priority,
-                "task_type": t.task_type,
-                "sessions_per_week": t.sessions_per_week,
-                "fixed_day": t.fixed_day,
-                "fixed_start": t.fixed_start,
-                "preferred_time": t.preferred_time,
-                "energy": t.energy,
-                "location": t.location,
-                "splittable": t.splittable,
-                "min_block_min": t.min_block_min,
-                "max_block_min": t.max_block_min,
-                "can_overlap": t.can_overlap,
-                "category": t.category,
-                "notes": t.notes,
-                "confidence": t.confidence,
-                "duration_is_estimated": t.duration_is_estimated,
-                "assumptions": t.assumptions,
-                "needs_clarification": t.needs_clarification,
-                "clarification_question": t.clarification_question,
-            }
-            for t in tasks
-        ],
-        "warnings": warnings or [],
-    }
+    return {"tasks": [t.__dict__ for t in tasks], "warnings": warnings or []}
 
 def validate_ai_tasks(tasks):
     issues = []
     for i, t in enumerate(tasks):
-        label = f"Task {i+1} ({t.title})"
+        label = f"Task {i + 1} ({t.title})"
         if t.fixed_day and t.fixed_start and t.task_type != "Fixed":
             issues.append(f"{label}: has fixed_day and fixed_start but task_type is {t.task_type}; usually this should be Fixed.")
         if t.task_type == "Fixed" and (not t.fixed_day or not t.fixed_start):
@@ -199,21 +167,15 @@ def _call_ai(client, model, messages):
     )
     return json.loads(response.choices[0].message.content)
 
-def parse_tasks_with_ai(raw_text: str, api_key: str, model: str = "gpt-4.1-mini", repair_passes: int = 1):
+def parse_tasks_with_ai(raw_text: str, api_key: str, model: str = "gpt-4.1-mini", repair_passes: int = 1, user_defaults=None):
     if not api_key:
         raise ValueError("Missing OpenAI API key.")
 
+    defaults_text = json.dumps(user_defaults or {}, ensure_ascii=False, indent=2)
+    user_message = f"User defaults for missing/estimated values:\n{defaults_text}\n\nRaw task text:\n{raw_text}"
+
     client = OpenAI(api_key=api_key)
-
-    data = _call_ai(
-        client,
-        model,
-        [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": raw_text},
-        ],
-    )
-
+    data = _call_ai(client, model, [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": user_message}])
     tasks = [_task_from_dict(item) for item in data.get("tasks", [])]
     warnings = list(data.get("warnings", []))
     issues = validate_ai_tasks(tasks)
@@ -221,25 +183,12 @@ def parse_tasks_with_ai(raw_text: str, api_key: str, model: str = "gpt-4.1-mini"
     for _ in range(repair_passes):
         if not issues:
             break
-        repair_input = {
-            "original_user_text": raw_text,
-            "current_json": _tasks_to_payload(tasks, warnings),
-            "validation_issues": issues,
-        }
-        data = _call_ai(
-            client,
-            model,
-            [
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "system", "content": REPAIR_PROMPT},
-                {"role": "user", "content": json.dumps(repair_input, ensure_ascii=False)},
-            ],
-        )
+        repair_input = {"original_user_text": raw_text, "user_defaults": user_defaults or {}, "current_json": _tasks_to_payload(tasks, warnings), "validation_issues": issues}
+        data = _call_ai(client, model, [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "system", "content": REPAIR_PROMPT}, {"role": "user", "content": json.dumps(repair_input, ensure_ascii=False)}])
         tasks = [_task_from_dict(item) for item in data.get("tasks", [])]
         warnings = list(data.get("warnings", []))
         issues = validate_ai_tasks(tasks)
 
     if issues:
         warnings.extend(issues)
-
     return tasks, warnings

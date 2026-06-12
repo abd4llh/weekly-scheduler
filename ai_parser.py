@@ -61,8 +61,8 @@ Scheduling ontology:
 Planning constraints:
 - required_day: use when the user specifies a day but not an exact time, e.g. "Sunday afternoon", "Tuesday morning", "on Friday".
 - earliest_day: use when a task should not begin before a day, e.g. "after Wednesday", "once supplies arrive Tuesday".
-- deadline_day/deadline_time: use for constraints like "before Friday evening", "by Thursday", "before 18:00". Use deadline_time as HH:MM when possible.
-- depends_on: use when a task logically depends on another task being done first, e.g. varnishing/packing after painting, editing after drafting, delivery after preparation. Put the clean title of the prerequisite task.
+- deadline_day/deadline_time: use only for explicit deadline constraints like "before Friday evening", "by Thursday", "due before 18:00". Do not infer a deadline from unrelated future events.
+- depends_on: use only when a task logically depends on another task being done first, e.g. varnishing/packing after painting, editing after drafting, delivery after preparation. Put the clean title of the prerequisite task.
 - phase: rough order group. Use 1 for main/prep work, 2 for follow-up/finishing, 3 for delivery/export/review. Keep 0 if no order is implied.
 
 Important duration semantics:
@@ -138,6 +138,12 @@ def _to_bool(value, default=False):
 def _has_explicit_time(text):
     return bool(re.search(r"\b\d{1,2}:\d{2}\b", text))
 
+def _has_deadline_language(text):
+    return any(token in f" {text} " for token in [" before ", " by ", " due ", " deadline ", " no later "])
+
+def _has_dependency_language(text):
+    return any(token in f" {text} " for token in [" after ", " once ", " following ", " then ", "subsequent", "varnish", "photograph", "packing", "pack", "ship", "deliver", "submit", "finalize", "proofread"])
+
 def _infer_repeat_count(text):
     repeat_patterns = [
         (7, ["every day", "daily", "each day"]),
@@ -153,6 +159,22 @@ def _infer_repeat_count(text):
 
 def _postprocess_task(task):
     text = f"{task.title} {task.notes} {task.assumptions}".lower()
+
+    if "morning" in text and task.preferred_time in ["Any", "Weekend"]:
+        task.preferred_time = "Morning"
+    elif "afternoon" in text and task.preferred_time in ["Any", "Weekend"]:
+        task.preferred_time = "Afternoon"
+    elif "evening" in text and task.preferred_time in ["Any", "Weekend"]:
+        task.preferred_time = "Evening"
+
+    if task.deadline_day and not _has_deadline_language(text):
+        task.deadline_day = ""
+        task.deadline_time = ""
+    elif task.deadline_day and not task.deadline_time:
+        task.deadline_time = "18:00" if "evening" in text else "23:00"
+
+    if task.depends_on and not _has_dependency_language(text) and task.phase <= 1:
+        task.depends_on = ""
 
     repeat_count = _infer_repeat_count(text)
     if repeat_count and task.task_type in ["Flexible", "Multi-session"]:
@@ -194,7 +216,7 @@ def _postprocess_task(task):
         task.task_type = "Flexible"
     if task.task_type == "Fixed" and task.fixed_day and task.fixed_start and any(word in text for word in soft_day_words):
         if not _has_explicit_time(text):
-            if "before" in text or " by " in f" {text} ":
+            if _has_deadline_language(text):
                 task.deadline_day = task.fixed_day
                 if not task.deadline_time:
                     task.deadline_time = "18:00" if "evening" in text else "23:00"
@@ -214,14 +236,16 @@ def _infer_dependencies(tasks):
     candidates = []
     for task in tasks:
         text = f"{task.title} {task.notes}".lower()
-        if any(word in text for word in ["main", "draft", "prepare", "paint", "painting", "write", "build", "create"]):
+        is_followup = any(word in text for word in ["varnish", "photograph", "packing", "pack", "ship", "deliver", "submit", "finalize", "review", "edit", "proofread"])
+        is_main = any(word in text for word in ["main", "paint", "painting", "write", "draft", "build", "create"])
+        if is_main and not is_followup:
             candidates.append(task)
 
     for task in tasks:
         if task.depends_on:
             continue
         text = f"{task.title} {task.notes}".lower()
-        is_followup = any(word in text for word in ["varnish", "photograph", "packing", "pack", "ship", "deliver", "submit", "finalize", "review", "edit", "proofread"])
+        is_followup = any(word in text for word in ["varnish", "photograph", "packing", "pack", "ship", "deliver", "submit", "finalize", "proofread"])
         if not is_followup:
             continue
         best = None
@@ -242,6 +266,7 @@ def _infer_dependencies(tasks):
 def _postprocess_tasks(tasks):
     tasks = [_postprocess_task(task) for task in tasks]
     tasks = _infer_dependencies(tasks)
+    tasks = [_postprocess_task(task) for task in tasks]
     return tasks
 
 def _task_from_dict(item):

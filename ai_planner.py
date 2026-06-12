@@ -16,16 +16,11 @@ LOCATIONS = ["Lab", "Home", "Gym", "Any"]
 
 AI_PLANNER_PROMPT = """
 You are the planning brain of a public weekly scheduling app.
-
-Users may write with grammar mistakes, spelling mistakes, missing punctuation, informal wording, transliteration, or mixed languages. They may switch language mid-sentence. Understand intent, not only exact keywords.
+Users may write with grammar mistakes, spelling mistakes, informal wording, transliteration, or mixed languages. Understand intent, not only exact keywords.
 
 Create a complete weekly calendar from messy user text.
 
-You receive:
-1. The original raw user text. Trust this most.
-2. Parsed task hints. Treat explicit durations, fixed times, recurrence counts, dependencies, and day/time constraints in these hints as anchors unless the raw text clearly contradicts them.
-3. User settings such as wake time, sleep time, planning mode, and weekend protection.
-4. Previous validation errors during repair passes, if any.
+You receive parsed task hints and duration anchors. Treat explicit durations, fixed times, recurrence counts, dependencies, and day/time constraints in those hints as anchors unless the raw text clearly contradicts them.
 
 Return ONLY valid JSON with this shape:
 {
@@ -78,15 +73,13 @@ Hard rules:
 - Do not overlap events unless a task can clearly overlap.
 - Keep events inside wake/sleep time.
 - Respect explicit total durations exactly. If the user says 12 hours, schedule exactly 12 hours total.
-- Do not silently change task durations from the parsed task hints.
+- Do not silently change task durations from parsed task hints.
 - For Recurring tasks, duration_min is per session; sessions_per_week is the count.
-- For Multi-session tasks, duration_min is the total weekly duration; split it into useful blocks.
-- If the user says "twice this week", create two sessions.
-- If the user says "every morning", schedule one morning session per day.
-- If the user says "Sunday afternoon", schedule on Sunday during the afternoon, not Sunday morning.
+- For Multi-session tasks, duration_min is total weekly duration.
 - If task B logically happens after task A, schedule B after A is complete.
+- If the user says "Sunday afternoon", schedule on Sunday afternoon, not Sunday morning.
 - Do not invent unnecessary deadlines or dependencies.
-- If the prompt contains multiple languages, preserve task meaning in concise English titles.
+- If the prompt contains multiple languages, preserve meaning in concise English titles.
 
 Time-of-day interpretation:
 - Morning: 06:00-12:00
@@ -94,17 +87,10 @@ Time-of-day interpretation:
 - Evening: 17:00-22:00
 - Workday: Monday-Friday, normally 09:00-17:00
 - Weekend: Saturday-Sunday
-
-Use realistic defaults when duration is missing:
-- Exercise/gym: 60-120 min.
-- Cooking/meal prep: 45-90 min.
-- Social/relationship call: 30-90 min.
-- Admin/social-media update: 30-90 min.
-- Quiet planning/rest: 60-120 min.
 """
 
 REPAIR_PROMPT = """
-The previous plan failed deterministic validation. Repair the JSON schedule. Keep the user's intent, preserve parsed task duration anchors, keep fixed events fixed, and satisfy the listed validation errors. Return ONLY valid JSON with the same shape.
+The previous plan failed deterministic validation. Repair the JSON schedule. Preserve parsed task duration anchors, keep fixed events fixed, and satisfy the listed validation errors. Return ONLY valid JSON with the same shape.
 """
 
 
@@ -280,6 +266,50 @@ def _scheduled_minutes(events: List[Event]) -> int:
     return sum(event.end_min - event.start_min for event in events)
 
 
+def apply_duration_anchors(tasks: List[Task], events: List[Event], anchors: List[Task]):
+    if not anchors:
+        return tasks, events
+    events = list(events)
+    for anchor in anchors:
+        matched, score = _best_task_match(anchor, tasks)
+        if not matched or score < 0.25:
+            continue
+
+        matched.duration_min = anchor.duration_min
+        matched.task_type = anchor.task_type
+        matched.sessions_per_week = anchor.sessions_per_week
+        if anchor.fixed_day:
+            matched.fixed_day = anchor.fixed_day
+        if anchor.fixed_start:
+            matched.fixed_start = anchor.fixed_start
+        if anchor.required_day:
+            matched.required_day = anchor.required_day
+        if anchor.preferred_time != "Any":
+            matched.preferred_time = anchor.preferred_time
+        if anchor.depends_on:
+            matched.depends_on = anchor.depends_on
+
+        task_events = [event for event in events if event.source_task == matched.title]
+        surplus = _scheduled_minutes(task_events) - expected_minutes(anchor)
+        if surplus <= 0 or matched.task_type == "Fixed":
+            continue
+
+        for event in sorted(task_events, key=lambda e: (e.day_index, e.start_min), reverse=True):
+            if surplus <= 0:
+                break
+            duration = event.end_min - event.start_min
+            if surplus >= duration:
+                if event in events:
+                    events.remove(event)
+                surplus -= duration
+            else:
+                event.end_min -= surplus
+                surplus = 0
+
+    events.sort(key=lambda event: (event.day_index, event.start_min, event.end_min, event.title))
+    return tasks, events
+
+
 def validate_ai_plan(tasks: List[Task], events: List[Event], unscheduled: List[UnscheduledTask], wake_min: int, sleep_min: int, anchors: List[Task] = None) -> List[Dict]:
     issues = []
     task_by_title = {task.title: task for task in tasks}
@@ -324,7 +354,7 @@ def validate_ai_plan(tasks: List[Task], events: List[Event], unscheduled: List[U
             if required is not None and any(event.day_index != required for event in task_events):
                 issues.append({"level": "error", "task": task.title, "message": f"Task must be scheduled on {task.required_day}."})
 
-        if task.required_day and task.preferred_time in ["Morning", "Afternoon", "Evening"]:
+        if task.task_type != "Fixed" and not task.fixed_start and task.required_day and task.preferred_time in ["Morning", "Afternoon", "Evening"]:
             if any(not time_pref_ok(task, event) for event in task_events):
                 issues.append({"level": "error", "task": task.title, "message": f"Task says {task.required_day} {task.preferred_time.lower()}, but at least one event is outside that time window."})
 
@@ -384,6 +414,13 @@ def _payload_from_data(data: Dict) -> Tuple[List[Task], List[Event], List[Unsche
     return tasks, events, unscheduled, warnings
 
 
+def _duration_anchors(parsed_tasks: List[Task]):
+    return [
+        {"title": task.title, "expected_minutes": expected_minutes(task), "task_type": task.task_type, "sessions_per_week": task.sessions_per_week}
+        for task in parsed_tasks
+    ]
+
+
 def plan_week_with_ai(raw_text: str, parsed_tasks: List[Task], api_key: str, model: str, settings: Dict, repair_passes: int = 2):
     if not api_key:
         raise ValueError("Missing OpenAI API key.")
@@ -394,7 +431,7 @@ def plan_week_with_ai(raw_text: str, parsed_tasks: List[Task], api_key: str, mod
     user_payload = {
         "raw_user_text": raw_text,
         "parsed_task_hints": [asdict(task) for task in parsed_tasks],
-        "duration_anchors": [{"title": task.title, "expected_minutes": expected_minutes(task), "task_type": task.task_type, "sessions_per_week": task.sessions_per_week} for task in parsed_tasks],
+        "duration_anchors": _duration_anchors(parsed_tasks),
         "settings": settings,
     }
     messages = [
@@ -403,6 +440,7 @@ def plan_week_with_ai(raw_text: str, parsed_tasks: List[Task], api_key: str, mod
     ]
     data = _call_ai(client, model, messages)
     tasks, events, unscheduled, warnings = _payload_from_data(data)
+    tasks, events = apply_duration_anchors(tasks, events, parsed_tasks)
     issues = validate_ai_plan(tasks, events, unscheduled, wake_min, sleep_min, parsed_tasks)
 
     for _ in range(repair_passes):
@@ -412,7 +450,7 @@ def plan_week_with_ai(raw_text: str, parsed_tasks: List[Task], api_key: str, mod
             "raw_user_text": raw_text,
             "settings": settings,
             "parsed_task_hints": [asdict(task) for task in parsed_tasks],
-            "duration_anchors": [{"title": task.title, "expected_minutes": expected_minutes(task), "task_type": task.task_type, "sessions_per_week": task.sessions_per_week} for task in parsed_tasks],
+            "duration_anchors": _duration_anchors(parsed_tasks),
             "current_plan": {
                 "tasks": [asdict(task) for task in tasks],
                 "events": [asdict(event) for event in events],
@@ -428,6 +466,7 @@ def plan_week_with_ai(raw_text: str, parsed_tasks: List[Task], api_key: str, mod
         ]
         data = _call_ai(client, model, messages)
         tasks, events, unscheduled, warnings = _payload_from_data(data)
+        tasks, events = apply_duration_anchors(tasks, events, parsed_tasks)
         issues = validate_ai_plan(tasks, events, unscheduled, wake_min, sleep_min, parsed_tasks)
 
     return tasks, events, unscheduled, issues, warnings

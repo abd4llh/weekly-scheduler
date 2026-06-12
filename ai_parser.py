@@ -77,6 +77,8 @@ General principles:
 - If a day is provided without an exact time, do NOT invent a fixed_start. Use required_day and preferred_time instead.
 - If a deadline is provided without an exact event time, use deadline_day/deadline_time instead of task_type="Fixed".
 - If a task repeats, use task_type="Recurring" and sessions_per_week > 1.
+- If wording says "twice this week", use task_type="Recurring" and sessions_per_week=2.
+- If wording says "three times this week" or "three times a week", use task_type="Recurring" and sessions_per_week=3.
 - If total work is large and can be split, use task_type="Multi-session".
 - If duration is missing, estimate conservatively and set duration_is_estimated=true.
 - If duration is explicit, set duration_is_estimated=false.
@@ -133,8 +135,32 @@ def _to_bool(value, default=False):
         return value.strip().lower() in ["true", "yes", "1"]
     return default
 
+def _has_explicit_time(text):
+    return bool(re.search(r"\b\d{1,2}:\d{2}\b", text))
+
+def _infer_repeat_count(text):
+    repeat_patterns = [
+        (7, ["every day", "daily", "each day"]),
+        (2, ["twice", "two times", "2 times"]),
+        (3, ["three times", "3 times"]),
+        (4, ["four times", "4 times"]),
+        (5, ["five times", "5 times"]),
+    ]
+    for count, patterns in repeat_patterns:
+        if any(pattern in text for pattern in patterns):
+            return count
+    return None
+
 def _postprocess_task(task):
     text = f"{task.title} {task.notes} {task.assumptions}".lower()
+
+    repeat_count = _infer_repeat_count(text)
+    if repeat_count and task.task_type in ["Flexible", "Multi-session"]:
+        task.task_type = "Recurring"
+        task.sessions_per_week = repeat_count
+        task.splittable = False
+    elif repeat_count and task.task_type == "Recurring":
+        task.sessions_per_week = repeat_count
 
     if task.task_type == "Recurring" and task.duration_is_estimated:
         if task.category == "Health" or task.energy == "Physical":
@@ -161,16 +187,19 @@ def _postprocess_task(task):
         if not any(word in text for word in overlap_words):
             task.can_overlap = False
 
-    # If AI invented a fixed time for a soft day phrase, keep it as a day constraint instead.
     soft_day_words = ["morning", "afternoon", "evening", "before", "by", "sometime"]
     if task.task_type == "Fixed" and task.fixed_day and not task.fixed_start:
         task.required_day = task.fixed_day
         task.fixed_day = ""
         task.task_type = "Flexible"
     if task.task_type == "Fixed" and task.fixed_day and task.fixed_start and any(word in text for word in soft_day_words):
-        # Only demote if the note does not contain an explicit clock-time phrase.
-        if not re.search(r"\b\d{1,2}:\d{2}\b", text):
-            task.required_day = task.fixed_day
+        if not _has_explicit_time(text):
+            if "before" in text or " by " in f" {text} ":
+                task.deadline_day = task.fixed_day
+                if not task.deadline_time:
+                    task.deadline_time = "18:00" if "evening" in text else "23:00"
+            else:
+                task.required_day = task.fixed_day
             task.fixed_day = ""
             task.fixed_start = ""
             task.task_type = "Flexible"
@@ -179,12 +208,48 @@ def _postprocess_task(task):
     task.max_block_min = min(max(int(task.max_block_min), int(task.min_block_min)), int(task.duration_min))
     return task
 
+def _infer_dependencies(tasks):
+    if not tasks:
+        return tasks
+    candidates = []
+    for task in tasks:
+        text = f"{task.title} {task.notes}".lower()
+        if any(word in text for word in ["main", "draft", "prepare", "paint", "painting", "write", "build", "create"]):
+            candidates.append(task)
+
+    for task in tasks:
+        if task.depends_on:
+            continue
+        text = f"{task.title} {task.notes}".lower()
+        is_followup = any(word in text for word in ["varnish", "photograph", "packing", "pack", "ship", "deliver", "submit", "finalize", "review", "edit", "proofread"])
+        if not is_followup:
+            continue
+        best = None
+        for candidate in candidates:
+            if candidate.title == task.title:
+                continue
+            candidate_text = f"{candidate.title} {candidate.notes}".lower()
+            shared_domain = any(word in text and word in candidate_text for word in ["painting", "paper", "report", "portrait", "commission", "artwork", "draft"])
+            if shared_domain or ("painting" in text and "paint" in candidate_text):
+                best = candidate
+                break
+        if best:
+            task.depends_on = best.title
+            if task.phase == 0:
+                task.phase = max(getattr(best, "phase", 1) + 1, 2)
+    return tasks
+
+def _postprocess_tasks(tasks):
+    tasks = [_postprocess_task(task) for task in tasks]
+    tasks = _infer_dependencies(tasks)
+    return tasks
+
 def _task_from_dict(item):
     duration = _to_int(item.get("duration_min"), 60, 1, 1440)
     min_block = _to_int(item.get("min_block_min"), min(30, duration), 1, duration)
     max_block = _to_int(item.get("max_block_min"), max(min_block, min(duration, 180)), min_block, 1440)
 
-    task = Task(
+    return Task(
         title=str(item.get("title") or "Untitled task")[:120],
         duration_min=duration,
         priority=_pick(item.get("priority"), PRIORITIES, "Medium"),
@@ -213,7 +278,6 @@ def _task_from_dict(item):
         needs_clarification=_to_bool(item.get("needs_clarification"), False),
         clarification_question=str(item.get("clarification_question") or ""),
     )
-    return _postprocess_task(task)
 
 def _tasks_to_payload(tasks, warnings=None):
     return {"tasks": [t.__dict__ for t in tasks], "warnings": warnings or []}
@@ -262,7 +326,7 @@ def parse_tasks_with_ai(raw_text: str, api_key: str, model: str = "gpt-4.1-mini"
 
     client = OpenAI(api_key=api_key)
     data = _call_ai(client, model, [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": user_message}])
-    tasks = [_task_from_dict(item) for item in data.get("tasks", [])]
+    tasks = _postprocess_tasks([_task_from_dict(item) for item in data.get("tasks", [])])
     warnings = list(data.get("warnings", []))
     issues = validate_ai_tasks(tasks)
 
@@ -271,7 +335,7 @@ def parse_tasks_with_ai(raw_text: str, api_key: str, model: str = "gpt-4.1-mini"
             break
         repair_input = {"original_user_text": raw_text, "current_json": _tasks_to_payload(tasks, warnings), "validation_issues": issues}
         data = _call_ai(client, model, [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "system", "content": REPAIR_PROMPT}, {"role": "user", "content": json.dumps(repair_input, ensure_ascii=False)}])
-        tasks = [_task_from_dict(item) for item in data.get("tasks", [])]
+        tasks = _postprocess_tasks([_task_from_dict(item) for item in data.get("tasks", [])])
         warnings = list(data.get("warnings", []))
         issues = validate_ai_tasks(tasks)
 

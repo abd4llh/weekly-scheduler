@@ -18,6 +18,14 @@ PRIORITY_TO_SCORE = {
     "Optional": 10,
 }
 
+ROUTINE_SEQUENCE_RANK = {
+    "morning routine": 10,
+    "breakfast": 20,
+    "lunch": 50,
+    "dinner": 80,
+    "evening wind-down": 95,
+}
+
 
 def _slug(value: str) -> str:
     cleaned = re.sub(r"[^a-z0-9]+", "-", value.lower()).strip("-")
@@ -37,62 +45,113 @@ def _at_day(week_start: datetime, day_index: int, minute_of_day: int) -> datetim
     )
 
 
-def _preferred_windows(task: LegacyTask, wake_min: int, sleep_min: int) -> Tuple[TimeWindow, ...]:
+def _clamp_target(start_min: int, end_min: int, target_min: int, duration_min: int) -> int:
+    latest_start = max(start_min, end_min - duration_min)
+    return min(max(target_min, start_min), latest_start)
+
+
+def _preferred_windows(
+    task: LegacyTask,
+    wake_min: int,
+    sleep_min: int,
+) -> Tuple[TimeWindow, ...]:
     preferred = str(task.preferred_time or "Any")
     required_day = _day_index(task.required_day or task.fixed_day)
     weekdays = (required_day,) if required_day is not None else (None,)
+    duration = max(5, int(task.duration_min))
 
     if preferred == "Morning":
-        bounds = (wake_min, min(12 * 60, sleep_min))
+        start, end = max(wake_min, 7 * 60), min(12 * 60, sleep_min)
+        target = _clamp_target(start, end, max(8 * 60 + 30, wake_min + 120), duration)
     elif preferred == "Workday":
-        bounds = (max(9 * 60, wake_min), min(17 * 60, sleep_min))
+        start, end = max(9 * 60, wake_min), min(17 * 60, sleep_min)
+        target = _clamp_target(start, end, 10 * 60, duration)
     elif preferred == "Afternoon":
-        bounds = (max(12 * 60, wake_min), min(18 * 60, sleep_min))
+        start, end = max(13 * 60, wake_min), min(18 * 60, sleep_min)
+        target = _clamp_target(start, end, 14 * 60 + 30, duration)
     elif preferred == "Evening":
-        bounds = (max(17 * 60, wake_min), min(22 * 60, sleep_min))
+        start, end = max(18 * 60, wake_min), min(22 * 60, sleep_min)
+        target = _clamp_target(start, end, 19 * 60, duration)
     elif preferred == "Weekend":
         return tuple(
-            TimeWindow(wake_min, sleep_min, weekday=weekday)
+            TimeWindow(
+                wake_min,
+                sleep_min,
+                weekday=weekday,
+                preferred_start_min=_clamp_target(wake_min, sleep_min, 10 * 60, duration),
+                outside_penalty=16,
+            )
             for weekday in (5, 6)
         )
     else:
         return ()
 
-    if bounds[1] <= bounds[0]:
+    if end <= start:
         return ()
-    return tuple(TimeWindow(bounds[0], bounds[1], weekday=weekday) for weekday in weekdays)
+    return tuple(
+        TimeWindow(
+            start,
+            end,
+            weekday=weekday,
+            preferred_start_min=target,
+            outside_penalty=16,
+        )
+        for weekday in weekdays
+    )
 
 
-def _routine_windows(settings: Dict | None, sleep_min: int) -> Dict[str, Tuple[TimeWindow, ...]]:
+def _routine_windows(settings: Dict | None) -> Dict[str, Tuple[TimeWindow, ...]]:
     if not settings:
         return {}
     output = {}
     meal_titles = {"Breakfast", "Lunch", "Dinner"}
     for requirement in routine_requirements_from_settings(settings):
         title = requirement["title"]
-        windows = []
-        for day in range(7):
-            windows.append(
-                TimeWindow(
-                    int(requirement["window_start_min"]),
-                    int(requirement["window_end_min"]),
-                    weekday=day,
-                    weight=4,
-                    prefer_later_fallback=title in meal_titles,
-                )
+        duration = int(requirement["duration_min"])
+        start = int(requirement["window_start_min"])
+        end = int(requirement["window_end_min"])
+        preferred = _clamp_target(
+            start,
+            end,
+            int(requirement["preferred_start_min"]),
+            duration,
+        )
+        output[title.strip().lower()] = tuple(
+            TimeWindow(
+                start,
+                end,
+                weekday=day,
+                weight=4,
+                preferred_start_min=preferred,
+                outside_penalty=24,
+                prefer_later_fallback=title in meal_titles,
             )
-            if title in meal_titles and int(requirement["window_end_min"]) < sleep_min:
-                windows.append(
-                    TimeWindow(
-                        int(requirement["window_end_min"]),
-                        sleep_min,
-                        weekday=day,
-                        weight=1,
-                        prefer_later_fallback=True,
-                    )
-                )
-        output[title.strip().lower()] = tuple(windows)
+            for day in range(7)
+        )
     return output
+
+
+def _daily_sequence_rank(task: LegacyTask) -> int | None:
+    title = task.title.strip().lower()
+    if title in ROUTINE_SEQUENCE_RANK:
+        return ROUTINE_SEQUENCE_RANK[title]
+    if task.preferred_time == "Morning":
+        return 30
+    if task.preferred_time == "Afternoon":
+        return 60
+    if task.preferred_time == "Evening":
+        return 85
+    return None
+
+
+def _transition_after(task: LegacyTask, transition_min: int) -> int:
+    if transition_min <= 0 or task.category == "Routine":
+        return 0
+    if task.task_type == "Fixed":
+        return transition_min
+    if str(task.energy or "").lower() in {"high", "physical", "creative"}:
+        return transition_min
+    return 0
 
 
 def legacy_tasks_to_plan_request(
@@ -124,12 +183,13 @@ def legacy_tasks_to_plan_request(
         task.title.strip().lower(): task_id
         for task, task_id in zip(tasks, ids)
     }
-    routine_windows = _routine_windows(routine_settings, sleep_min)
+    routine_windows = _routine_windows(routine_settings)
 
     canonical_tasks = []
     for task, task_id in zip(tasks, ids):
         sessions = max(1, int(task.sessions_per_week or 1))
         is_recurring = task.task_type == "Recurring"
+        is_multi_session = task.task_type == "Multi-session"
         total_duration = int(task.duration_min) * sessions if is_recurring else int(task.duration_min)
 
         fixed_start = None
@@ -173,6 +233,7 @@ def legacy_tasks_to_plan_request(
             _preferred_windows(task, wake_min, sleep_min),
         )
 
+        requested_sessions = sessions if (is_recurring or (is_multi_session and sessions > 1)) else None
         canonical_tasks.append(
             PlanningTask(
                 id=task_id,
@@ -188,12 +249,14 @@ def legacy_tasks_to_plan_request(
                 dependencies=dependencies,
                 min_block_min=max(slot_minutes, int(task.min_block_min or slot_minutes)),
                 max_block_min=max(slot_minutes, int(task.max_block_min or total_duration)),
-                sessions_required=sessions if is_recurring else None,
+                sessions_required=requested_sessions,
                 distinct_session_days=is_recurring,
                 splittable=bool(task.splittable or task.task_type in {"Recurring", "Multi-session"}),
                 energy=str(task.energy or "medium").lower(),
                 location=str(task.location or "any").lower(),
                 locked=task.task_type == "Fixed",
+                daily_sequence_rank=_daily_sequence_rank(task),
+                transition_after_min=_transition_after(task, transition_min),
             )
         )
 

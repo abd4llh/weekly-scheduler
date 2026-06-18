@@ -2,6 +2,8 @@
 
 Development branch: `feature/v0.12-optimizer-foundation`
 
+Draft pull request: `#1 — v0.12 optimizer foundation`
+
 ## Objective
 
 Move exact calendar placement out of the AI planner and into an OR-Tools CP-SAT optimization engine.
@@ -35,6 +37,7 @@ The existing `main` branch remains the stable legacy application while this bran
 - Daily-load balancing objective
 - Adapter from the current `models.Task` / `models.Event` objects
 - Unit tests and branch-specific GitHub Actions workflow
+- Passing optimizer and legacy-adapter test suite
 
 ## Hard constraints in the current solver
 
@@ -70,8 +73,7 @@ The existing `main` branch remains the stable legacy application while this bran
 
 ## Next implementation milestone
 
-1. Run and stabilize the optimizer test suite.
-2. Add an experimental optimizer mode to the Streamlit application on this branch.
-3. Compare the optimizer against the existing painter and personal-workload test prompts.
-4. Add explicit soft-routine windows and schedule-change penalties.
-5. Begin the interactive calendar component only after optimizer output is stable.
+1. Add an experimental optimizer mode to the Streamlit application on this branch.
+2. Compare the optimizer against the existing painter and personal-workload test prompts.
+3. Add explicit soft-routine windows and schedule-change penalties.
+4. Begin the interactive calendar component only after optimizer output is stable.

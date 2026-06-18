@@ -4,6 +4,7 @@ from models import DAY_NAMES, Event, Task, UnscheduledTask
 from parser_utils import hhmm_to_minutes, minutes_to_hhmm
 
 ROUTINE_CATEGORY = "Routine"
+ROUTINE_FALLBACK_PREFIX = "Scheduled outside the preferred window because"
 
 
 def _to_min(value, default):
@@ -20,7 +21,7 @@ def _clamp_window(start_min: int, end_min: int, wake_min: int, sleep_min: int):
 
 
 def routine_requirements_from_settings(settings: Dict) -> List[Dict]:
-    """Build flexible daily routine requirements from sidebar settings."""
+    """Build flexible daily routine preferences from sidebar settings."""
     wake_min = int(settings.get("wake_min", 360))
     sleep_min = int(settings.get("sleep_min", 1380))
     requirements = []
@@ -150,11 +151,14 @@ def routine_requirements_payload(settings: Dict) -> List[Dict]:
             "window_end": item["window_end"],
             "preferred_start": item["preferred_start"],
             "priority": item["priority"],
-            "hard_window": True,
+            "preferred_window": True,
             "fixed_time": False,
+            "allow_nearest_fallback": True,
             "instruction": (
-                "Schedule exactly once per day inside the window. Use preferred_start only when it fits; "
-                "fixed and higher-priority events take precedence."
+                "Schedule exactly once per day inside the preferred window when possible. "
+                "If the entire window is blocked by a fixed or higher-priority event, schedule it "
+                "at the nearest free time after that event; use a time before the window only when "
+                "nothing is available afterward."
             ),
         }
         for item in routine_requirements_from_settings(settings)
@@ -184,8 +188,9 @@ def normalize_routine_tasks(tasks: List[Task], settings: Dict) -> List[Task]:
             confidence=1.0,
             duration_is_estimated=False,
             assumptions=(
-                f"Schedule once daily for {item['duration_min']} minutes within "
-                f"{item['window_start']}–{item['window_end']}, preferably near {item['preferred_start']}."
+                f"Schedule once daily for {item['duration_min']} minutes, preferably within "
+                f"{item['window_start']}–{item['window_end']} near {item['preferred_start']}; "
+                "move to the nearest later slot if the full window is blocked."
             ),
         ))
     return clean
@@ -200,11 +205,13 @@ def _matches_routine(event: Event, title: str, day: int = None) -> bool:
     )
 
 
-def _slot_is_free(day: int, start: int, end: int, events: List[Event]) -> bool:
+def _slot_is_free(day: int, start: int, end: int, events: List[Event], buffer_min: int = 0) -> bool:
     for event in events:
         if event.day_index != day:
             continue
-        if max(start, event.start_min) < min(end, event.end_min):
+        busy_start = event.start_min - buffer_min
+        busy_end = event.end_min + buffer_min
+        if max(start, busy_start) < min(end, busy_end):
             return False
     return True
 
@@ -220,22 +227,73 @@ def _blocking_event_titles(day: int, start: int, end: int, events: List[Event]) 
     return titles
 
 
+def _candidate_starts(start: int, latest_start: int, preferred: int = None, reverse: bool = False) -> List[int]:
+    if latest_start < start:
+        return []
+    candidates = list(range(start, latest_start + 1, 15))
+    if preferred is not None:
+        candidates.sort(key=lambda value: (abs(value - preferred), value))
+    elif reverse:
+        candidates.reverse()
+    return candidates
+
+
+def _find_free_start(
+    day: int,
+    duration: int,
+    events: List[Event],
+    candidates: List[int],
+    buffer_min: int = 0,
+) -> int:
+    for start in candidates:
+        if _slot_is_free(day, start, start + duration, events, buffer_min):
+            return start
+    if buffer_min:
+        for start in candidates:
+            if _slot_is_free(day, start, start + duration, events, 0):
+                return start
+    return None
+
+
+def _append_routine_event(
+    events: List[Event],
+    requirement: Dict,
+    day: int,
+    start: int,
+    explanation: str,
+):
+    events.append(Event(
+        title=requirement["title"],
+        day_index=day,
+        start_min=start,
+        end_min=start + int(requirement["duration_min"]),
+        priority=requirement["priority"],
+        source_task=requirement["title"],
+        notes=requirement["notes"],
+        explanation=explanation,
+        category=ROUTINE_CATEGORY,
+    ))
+
+
 def repair_routine_windows(
     tasks: List[Task],
     events: List[Event],
     unscheduled: List[UnscheduledTask],
     settings: Dict,
 ) -> Tuple[List[Task], List[Event], List[UnscheduledTask]]:
-    """Move enabled routines into their allowed windows or mark them unscheduled.
+    """Prefer routine windows, but keep the routine using the nearest fallback.
 
-    An out-of-window meal is never silently kept. If no valid slot exists inside
-    the configured window, the routine is removed from the calendar and listed
-    as unscheduled for that specific day.
+    A blocked meal window does not delete the meal. The routine is placed at the
+    nearest free time after the window/blocking event. A slot before the window
+    is used only when no later slot exists before sleep.
     """
     tasks = normalize_routine_tasks(list(tasks), settings)
     events = list(events)
     requirements = routine_requirements_from_settings(settings)
     routine_titles = {item["title"] for item in requirements}
+    wake_min = int(settings.get("wake_min", 360))
+    sleep_min = int(settings.get("sleep_min", 1380))
+    transition = max(0, min(int(settings.get("transition_min", 0)), 30))
 
     unscheduled = [
         item for item in unscheduled
@@ -270,40 +328,83 @@ def repair_routine_windows(
                 continue
 
             events = [event for event in events if event not in matches]
-            latest_start = window_end - duration
-            candidate_starts = list(range(window_start, latest_start + 1, 15)) if latest_start >= window_start else []
-            candidate_starts.sort(key=lambda start: (abs(start - preferred), start))
 
-            chosen = None
-            for start in candidate_starts:
-                if _slot_is_free(day, start, start + duration, events):
-                    chosen = start
-                    break
-
+            in_window = _candidate_starts(
+                window_start,
+                window_end - duration,
+                preferred=preferred,
+            )
+            chosen = _find_free_start(day, duration, events, in_window)
             if chosen is not None:
-                events.append(Event(
-                    title=title,
-                    day_index=day,
-                    start_min=chosen,
-                    end_min=chosen + duration,
-                    priority=requirement["priority"],
-                    source_task=title,
-                    notes=requirement["notes"],
-                    explanation=(
-                        f"Moved into the allowed {requirement['window_start']}–{requirement['window_end']} "
-                        "window while preserving fixed and higher-priority events."
+                _append_routine_event(
+                    events,
+                    requirement,
+                    day,
+                    chosen,
+                    (
+                        f"Placed inside the preferred {requirement['window_start']}–"
+                        f"{requirement['window_end']} window while preserving fixed and "
+                        "higher-priority events."
                     ),
-                    category=ROUTINE_CATEGORY,
-                ))
+                )
                 continue
 
             blockers = _blocking_event_titles(day, window_start, window_end, events)
-            blocker_text = ", ".join(blockers) if blockers else "the existing schedule"
+            blocker_text = ", ".join(blockers) if blockers else "other scheduled commitments"
+
+            after_candidates = _candidate_starts(window_end, sleep_min - duration)
+            chosen = _find_free_start(
+                day,
+                duration,
+                events,
+                after_candidates,
+                buffer_min=transition,
+            )
+            if chosen is not None:
+                _append_routine_event(
+                    events,
+                    requirement,
+                    day,
+                    chosen,
+                    (
+                        f"{ROUTINE_FALLBACK_PREFIX} the preferred "
+                        f"{requirement['window_start']}–{requirement['window_end']} window was "
+                        f"blocked by {blocker_text}; placed at the nearest available later time."
+                    ),
+                )
+                continue
+
+            before_candidates = _candidate_starts(
+                wake_min,
+                window_start - duration,
+                reverse=True,
+            )
+            chosen = _find_free_start(
+                day,
+                duration,
+                events,
+                before_candidates,
+                buffer_min=transition,
+            )
+            if chosen is not None:
+                _append_routine_event(
+                    events,
+                    requirement,
+                    day,
+                    chosen,
+                    (
+                        f"{ROUTINE_FALLBACK_PREFIX} the preferred "
+                        f"{requirement['window_start']}–{requirement['window_end']} window and all "
+                        "later time were unavailable; placed at the nearest available earlier time."
+                    ),
+                )
+                continue
+
             unscheduled.append(UnscheduledTask(
                 title=f"{title} ({DAY_NAMES[day]})",
                 reason=(
-                    f"No {duration}-minute slot exists inside {requirement['window_start']}–"
-                    f"{requirement['window_end']} because it conflicts with {blocker_text}."
+                    f"No {duration}-minute slot exists inside or outside the preferred "
+                    f"{requirement['window_start']}–{requirement['window_end']} window before sleep."
                 ),
                 task_type="Recurring",
                 priority=requirement["priority"],
@@ -325,9 +426,14 @@ def repair_routine_windows(
 def validate_routine_requirements(events, settings: Dict) -> List[Dict]:
     issues = []
     requirements = routine_requirements_from_settings(settings)
+    sleep_min = int(settings.get("sleep_min", 1380))
 
     for requirement in requirements:
         title = requirement["title"]
+        duration = int(requirement["duration_min"])
+        window_start = int(requirement["window_start_min"])
+        window_end = int(requirement["window_end_min"])
+
         for day in range(7):
             matches = [event for event in events if _matches_routine(event, title, day)]
             if len(matches) == 0:
@@ -342,68 +448,56 @@ def validate_routine_requirements(events, settings: Dict) -> List[Dict]:
 
             event = matches[0]
             actual_duration = event.end_min - event.start_min
-            if actual_duration != int(requirement["duration_min"]):
+            if actual_duration != duration:
                 issues.append({
                     "level": "error",
                     "task": title,
                     "message": (
-                        f"{title} must last {requirement['duration_min']} minutes; "
-                        f"scheduled {actual_duration} minutes."
+                        f"{title} must last {duration} minutes; scheduled {actual_duration} minutes."
                     ),
                 })
-            if (
-                event.start_min < int(requirement["window_start_min"])
-                or event.end_min > int(requirement["window_end_min"])
-            ):
+
+            inside_window = event.start_min >= window_start and event.end_min <= window_end
+            if inside_window:
+                continue
+
+            other_events = [candidate for candidate in events if candidate is not event]
+            in_window_candidates = _candidate_starts(
+                window_start,
+                window_end - duration,
+                preferred=int(requirement["preferred_start_min"]),
+            )
+            free_in_window = _find_free_start(
+                day,
+                duration,
+                other_events,
+                in_window_candidates,
+            )
+
+            valid_later_fallback = (
+                free_in_window is None
+                and event.start_min >= window_end
+                and event.end_min <= sleep_min
+            )
+            valid_earlier_fallback = (
+                free_in_window is None
+                and event.end_min <= window_start
+            )
+
+            if not (valid_later_fallback or valid_earlier_fallback):
                 issues.append({
                     "level": "error",
                     "task": title,
                     "message": (
-                        f"{title} must fit inside {requirement['window_start']}–{requirement['window_end']}; "
-                        f"scheduled {minutes_to_hhmm(event.start_min)}–{minutes_to_hhmm(event.end_min)}."
+                        f"{title} is outside the preferred {requirement['window_start']}–"
+                        f"{requirement['window_end']} window even though a valid preferred or "
+                        "fallback placement was available."
                     ),
                 })
     return issues
 
 
 def place_routines_flexibly(tasks: List[Task], events: List[Event], settings: Dict) -> Tuple[List[Task], List[Event]]:
-    """Fallback routine placement inside windows after all higher-priority events."""
-    tasks = normalize_routine_tasks(tasks, settings)
-    events = [event for event in events if event.category != ROUTINE_CATEGORY]
-
-    for requirement in routine_requirements_from_settings(settings):
-        duration = int(requirement["duration_min"])
-        window_start = int(requirement["window_start_min"])
-        latest_start = int(requirement["window_end_min"]) - duration
-        preferred = int(requirement["preferred_start_min"])
-        candidate_starts = list(range(window_start, latest_start + 1, 15))
-        candidate_starts.sort(key=lambda start: (abs(start - preferred), start))
-
-        for day in range(7):
-            busy = [(event.start_min, event.end_min) for event in events if event.day_index == day]
-            chosen = None
-            for start in candidate_starts:
-                end = start + duration
-                if all(end <= busy_start or start >= busy_end for busy_start, busy_end in busy):
-                    chosen = start
-                    break
-            if chosen is None:
-                continue
-
-            events.append(Event(
-                title=requirement["title"],
-                day_index=day,
-                start_min=chosen,
-                end_min=chosen + duration,
-                priority=requirement["priority"],
-                source_task=requirement["title"],
-                notes=requirement["notes"],
-                explanation=(
-                    f"Placed inside the flexible {requirement['window_start']}–{requirement['window_end']} "
-                    "window while avoiding fixed and higher-priority events."
-                ),
-                category=ROUTINE_CATEGORY,
-            ))
-
-    events.sort(key=lambda event: (event.day_index, event.start_min, event.end_min, event.title))
+    """Fallback routine placement after higher-priority events."""
+    tasks, events, _ = repair_routine_windows(tasks, events, [], settings)
     return tasks, events

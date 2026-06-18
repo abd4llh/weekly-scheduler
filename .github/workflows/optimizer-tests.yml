@@ -28,10 +28,25 @@ jobs:
           cache: pip
 
       - name: Install dependencies
-        run: python -m pip install -r requirements-dev.txt
+        run: python -m pip install -q -r requirements-dev.txt
 
       - name: Compile optimizer modules
         run: python -m compileall -q domain optimizer tests
 
       - name: Run tests
-        run: pytest -q
+        id: pytest
+        shell: bash
+        run: |
+          set +e
+          pytest -q > pytest-output.txt 2>&1
+          code=$?
+          cat pytest-output.txt
+          exit $code
+
+      - name: Upload test output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: optimizer-pytest-output
+          path: pytest-output.txt
+          if-no-files-found: error

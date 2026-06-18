@@ -1,10 +1,7 @@
 from dataclasses import dataclass
 
-
 @dataclass(frozen=True)
 class OptimizerWeights:
-    """Integer penalty weights used by the CP-SAT objective."""
-
     preferred_window: int = 20
     weekend: int = 18
     late_start: int = 1
@@ -13,10 +10,10 @@ class OptimizerWeights:
     total_burden_overload: int = 22
     focused_work_overload: int = 28
     late_focused_work: int = 18
-    same_day_sessions: int = 5000
+    same_day_sessions: int = 250
+    spread_across_days: int = 120
     compact_gap: int = 2
     compact_gap_excess: int = 12
-
 
 @dataclass(frozen=True)
 class OptimizerConfig:

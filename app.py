@@ -6,12 +6,13 @@ import streamlit as st
 import streamlit.components.v1 as components
 
 from ai_parser import parse_tasks_with_ai
-from ai_planner import plan_week_with_ai
+from ai_planner import plan_week_with_ai, validate_ai_plan
 from calendar_utils import events_to_ics, next_monday, render_calendar_html
 from category_utils import normalize_task_categories
 from metrics_utils import workload_summary
 from models import APP_VERSION, CATEGORIES, DAY_NAMES, PLANNING_MODES, PRIORITY_SCORE, Task
 from parser_utils import minutes_to_hhmm, tasks_from_json, tasks_to_json
+from routine_utils import ROUTINE_CATEGORY, inject_routine_blocks, routine_anchor_payload
 from scheduler_engine import Scheduler
 
 st.set_page_config(page_title="Weekly Scheduler", page_icon="🗓️", layout="wide")
@@ -28,7 +29,7 @@ div[data-testid="stMetric"] {border: 1px solid #e5e7eb; border-radius: 14px; pad
 </style>
 <div class="hero">
   <h1>Weekly Scheduler</h1>
-  <p>Paste your week in natural language. Typos, imperfect grammar, and mixed languages are okay.</p>
+  <p>Paste your week in natural language. AI builds a realistic day around routines, meals, energy, and task order.</p>
 </div>
 """,
     unsafe_allow_html=True,
@@ -54,9 +55,60 @@ with st.sidebar:
     planning_mode = st.selectbox("Planning mode", PLANNING_MODES, index=0)
     protect_weekend = st.checkbox("Protect weekend from heavy work", value=True)
     include_focus_guard = st.checkbox("Add Focus Guard / transition blocks", value=False)
+
     st.divider()
     wake_time = st.time_input("Wake time", value=time(6, 0))
     sleep_time = st.time_input("Sleep target", value=time(23, 0))
+
+    with st.expander("Daily rhythm and meals", expanded=True):
+        morning_ramp_enabled = st.checkbox("Reserve wake-up / get-ready time", value=True)
+        morning_ramp_min = st.slider(
+            "Morning routine duration",
+            min_value=15,
+            max_value=120,
+            value=60,
+            step=15,
+            disabled=not morning_ramp_enabled,
+        )
+        st.caption("Prevents study and demanding work from starting immediately after waking.")
+
+        breakfast_enabled = st.checkbox("Add breakfast", value=False)
+        bc1, bc2 = st.columns(2)
+        with bc1:
+            breakfast_time = st.time_input("Breakfast time", value=time(7, 30), disabled=not breakfast_enabled)
+        with bc2:
+            breakfast_duration_min = st.selectbox("Breakfast min", [15, 30, 45, 60], index=1, disabled=not breakfast_enabled)
+
+        lunch_enabled = st.checkbox("Add lunch", value=False)
+        lc1, lc2 = st.columns(2)
+        with lc1:
+            lunch_time = st.time_input("Lunch time", value=time(13, 0), disabled=not lunch_enabled)
+        with lc2:
+            lunch_duration_min = st.selectbox("Lunch min", [15, 30, 45, 60, 75], index=2, disabled=not lunch_enabled)
+
+        dinner_enabled = st.checkbox("Add dinner", value=False)
+        dc1, dc2 = st.columns(2)
+        with dc1:
+            dinner_time = st.time_input("Dinner time", value=time(19, 0), disabled=not dinner_enabled)
+        with dc2:
+            dinner_duration_min = st.selectbox("Dinner min", [30, 45, 60, 75, 90], index=2, disabled=not dinner_enabled)
+
+        wind_down_enabled = st.checkbox("Add evening wind-down", value=False)
+        wind_down_min = st.slider(
+            "Wind-down duration",
+            min_value=15,
+            max_value=90,
+            value=30,
+            step=15,
+            disabled=not wind_down_enabled,
+        )
+
+        transition_min = st.select_slider(
+            "Preferred transition between demanding tasks",
+            options=[0, 5, 10, 15, 20, 30],
+            value=15,
+        )
+
     st.divider()
     start_hour = st.slider("Calendar start hour", 4, 10, 6)
     end_hour = st.slider("Calendar end hour", 18, 24, 23)
@@ -96,30 +148,36 @@ def df_to_tasks(df: pd.DataFrame):
     return normalize_task_categories(tasks)
 
 
+def user_tasks_only(tasks):
+    return [task for task in tasks if task.category != ROUTINE_CATEGORY]
+
+
 def simple_task_dataframe(tasks):
     rows = []
-    for task in tasks:
-        rows.append(
-            {
-                "Task": task.title,
-                "Duration": f"{task.duration_min} min" if task.task_type == "Recurring" else f"{task.duration_min} min total",
-                "Priority": task.priority,
-                "Category": task.category,
-                "Notes": task.notes,
-            }
-        )
+    for task in user_tasks_only(tasks):
+        rows.append({
+            "Task": task.title,
+            "Duration": f"{task.duration_min} min" if task.task_type == "Recurring" else f"{task.duration_min} min total",
+            "Priority": task.priority,
+            "Category": task.category,
+            "Notes": task.notes,
+        })
     return pd.DataFrame(rows)
 
 
 def technical_task_dataframe(tasks):
     hidden = {"confidence", "duration_is_estimated", "assumptions", "needs_clarification", "clarification_question"}
     rows = []
-    for task in tasks:
+    for task in user_tasks_only(tasks):
         row = asdict(task)
         for col in hidden:
             row.pop(col, None)
         rows.append(row)
     return pd.DataFrame(rows)
+
+
+def _time_text(value):
+    return value.strftime("%H:%M")
 
 
 def settings_payload():
@@ -135,6 +193,20 @@ def settings_payload():
         "include_focus_guard": include_focus_guard,
         "week_start": str(week_start),
         "timezone": "Europe/Berlin",
+        "morning_ramp_enabled": morning_ramp_enabled,
+        "morning_ramp_min": morning_ramp_min,
+        "breakfast_enabled": breakfast_enabled,
+        "breakfast_time": _time_text(breakfast_time),
+        "breakfast_duration_min": breakfast_duration_min,
+        "lunch_enabled": lunch_enabled,
+        "lunch_time": _time_text(lunch_time),
+        "lunch_duration_min": lunch_duration_min,
+        "dinner_enabled": dinner_enabled,
+        "dinner_time": _time_text(dinner_time),
+        "dinner_duration_min": dinner_duration_min,
+        "wind_down_enabled": wind_down_enabled,
+        "wind_down_min": wind_down_min,
+        "transition_min": transition_min,
     }
 
 
@@ -146,7 +218,16 @@ def deterministic_fallback(tasks):
         planning_mode=planning_mode,
     )
     events, unscheduled = scheduler.schedule(tasks, include_focus_guard)
-    return events, unscheduled, []
+    tasks_with_routines, events = inject_routine_blocks(tasks, events, settings_payload())
+    issues = validate_ai_plan(
+        tasks_with_routines,
+        events,
+        unscheduled,
+        wake_time.hour * 60 + wake_time.minute,
+        sleep_time.hour * 60 + sleep_time.minute,
+        tasks,
+    )
+    return tasks_with_routines, events, unscheduled, issues
 
 
 def generate_schedule_from_text(raw_text: str):
@@ -159,7 +240,7 @@ def generate_schedule_from_text(raw_text: str):
         st.error("Paste your tasks first.")
         return
 
-    with st.spinner("Generating your schedule..."):
+    with st.spinner("Generating a realistic weekly schedule..."):
         try:
             parsed_tasks, parse_warnings = parse_tasks_with_ai(raw_text, api_key, model=model)
             parsed_tasks = normalize_task_categories(parsed_tasks)
@@ -177,11 +258,11 @@ def generate_schedule_from_text(raw_text: str):
             st.session_state.ai_warnings = list(parse_warnings) + list(planner_warnings)
             st.session_state.editor_version += 1
         except Exception as exc:
-            st.warning(f"AI planner failed. Falling back to deterministic scheduler: {exc}")
+            st.warning(f"AI planner failed. Falling back to deterministic scheduling: {exc}")
             parsed_tasks, parse_warnings = parse_tasks_with_ai(raw_text, api_key, model=model)
             parsed_tasks = normalize_task_categories(parsed_tasks)
-            events, unscheduled, issues = deterministic_fallback(parsed_tasks)
-            st.session_state.parsed_tasks = parsed_tasks
+            tasks, events, unscheduled, issues = deterministic_fallback(parsed_tasks)
+            st.session_state.parsed_tasks = tasks
             st.session_state.events = events
             st.session_state.unscheduled = unscheduled
             st.session_state.issues = issues
@@ -218,6 +299,11 @@ with tab_tasks:
             except Exception as exc:
                 st.error(f"Could not load JSON: {exc}")
 
+    active_routines = routine_anchor_payload(settings_payload())
+    if active_routines:
+        with st.expander("Automatic daily routine blocks", expanded=False):
+            st.dataframe(pd.DataFrame(active_routines)[["title", "start", "end"]], use_container_width=True, hide_index=True)
+
     if st.session_state.ai_warnings:
         with st.expander("Items to review", expanded=True):
             for warning in st.session_state.ai_warnings:
@@ -225,7 +311,7 @@ with tab_tasks:
 
     if st.session_state.parsed_tasks:
         st.subheader("Detected tasks")
-        st.caption("Simplified view. Technical scheduling fields are hidden unless you open Advanced review.")
+        st.caption("Automatic routine blocks are controlled in the sidebar and hidden from this task list.")
         st.dataframe(simple_task_dataframe(st.session_state.parsed_tasks), use_container_width=True, hide_index=True)
 
         with st.expander("Advanced review / edit detected tasks", expanded=False):
@@ -287,21 +373,19 @@ events = st.session_state.events
 unscheduled = st.session_state.unscheduled
 issues = st.session_state.issues
 summary = workload_summary(events, unscheduled)
-schedule_df = pd.DataFrame(
-    [
-        {
-            "Day": DAY_NAMES[event.day_index],
-            "Start": minutes_to_hhmm(event.start_min),
-            "End": minutes_to_hhmm(event.end_min),
-            "Task": event.title,
-            "Category": event.category,
-            "Priority": event.priority,
-            "Explanation": event.explanation,
-            "Notes": event.notes,
-        }
-        for event in events
-    ]
-)
+schedule_df = pd.DataFrame([
+    {
+        "Day": DAY_NAMES[event.day_index],
+        "Start": minutes_to_hhmm(event.start_min),
+        "End": minutes_to_hhmm(event.end_min),
+        "Task": event.title,
+        "Category": event.category,
+        "Priority": event.priority,
+        "Explanation": event.explanation,
+        "Notes": event.notes,
+    }
+    for event in events
+])
 
 with tab_calendar:
     c1, c2, c3, c4, c5 = st.columns(5)

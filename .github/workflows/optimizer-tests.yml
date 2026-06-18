@@ -38,7 +38,7 @@ jobs:
         shell: bash
         run: |
           set +e
-          pytest -q > pytest-output.txt 2>&1
+          pytest -q tests > pytest-output.txt 2>&1
           code=$?
           cat pytest-output.txt
           exit $code

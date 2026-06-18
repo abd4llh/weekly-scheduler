@@ -28,8 +28,8 @@ class WeeklyOptimizer:
     """Single-horizon CP-SAT scheduler.
 
     The AI layer produces canonical ``PlanningTask`` objects. This class owns
-    exact placement, hard constraints, daily ordering, transition buffers and
-    weighted preference scoring.
+    exact placement, hard constraints, workload limits, travel/setup time,
+    session spreading, daily ordering and weighted preference scoring.
     """
 
     def __init__(self, config: OptimizerConfig | None = None) -> None:
@@ -58,7 +58,6 @@ class WeeklyOptimizer:
         task_start_vars: Dict[str, cp_model.IntVar] = {}
         task_end_vars: Dict[str, cp_model.IntVar] = {}
         task_sessions_by_id: Dict[str, List[_SessionVariable]] = {}
-        fixed_daily_load = [0 for _ in range(horizon_days)]
 
         imported_transition_slots = self._minutes_to_slots(request.transition_min, slot_minutes)
         for event in request.existing_events:
@@ -68,15 +67,16 @@ class WeeklyOptimizer:
             if clipped is None:
                 continue
             start_slot, end_slot = clipped
+            buffered_start = max(0, start_slot - imported_transition_slots)
             buffered_end = min(horizon_slots, end_slot + imported_transition_slots)
             fixed_intervals.append(
                 model.NewFixedSizeIntervalVar(
-                    start_slot,
-                    buffered_end - start_slot,
+                    buffered_start,
+                    buffered_end - buffered_start,
                     f"busy_{self._safe_name(event.id)}",
                 )
             )
-            fixed_busy_ranges.append((start_slot, buffered_end))
+            fixed_busy_ranges.append((buffered_start, buffered_end))
 
         sessions: List[_SessionVariable] = []
         all_intervals: List[cp_model.IntervalVar] = list(fixed_intervals)
@@ -86,22 +86,23 @@ class WeeklyOptimizer:
             if task.locked and task.fixed_start is None:
                 raise ValueError(f"Locked task '{task.id}' requires fixed_start/fixed_end.")
 
-            transition_slots = self._minutes_to_slots(task.transition_after_min, slot_minutes)
             if task.fixed_start is not None:
                 start_slot, end_slot = self._fixed_task_slots(task, request)
+                transition_slots = self._minutes_to_slots(
+                    max(request.transition_min, task.transition_after_min),
+                    slot_minutes,
+                )
+                buffered_start = max(0, start_slot - transition_slots)
                 buffered_end = min(horizon_slots, end_slot + transition_slots)
                 interval = model.NewFixedSizeIntervalVar(
-                    start_slot,
-                    buffered_end - start_slot,
+                    buffered_start,
+                    buffered_end - buffered_start,
                     f"fixed_task_{self._safe_name(task.id)}",
                 )
                 all_intervals.append(interval)
-                fixed_busy_ranges.append((start_slot, buffered_end))
+                fixed_busy_ranges.append((buffered_start, buffered_end))
                 task_start_vars[task.id] = model.NewConstant(start_slot)
                 task_end_vars[task.id] = model.NewConstant(end_slot)
-                day_index = self._day_offset(request.horizon_start, task.fixed_start)
-                if 0 <= day_index < horizon_days:
-                    fixed_daily_load[day_index] += end_slot - start_slot
                 fixed_task_events.append(
                     ScheduledEvent(
                         id=f"{task.id}:fixed",
@@ -143,10 +144,9 @@ class WeeklyOptimizer:
                 start_var = model.NewIntVarFromDomain(domain, f"start_{name}")
                 end_var = model.NewIntVar(0, horizon_slots, f"end_{name}")
                 model.Add(end_var == start_var + duration_slots)
-                buffered_duration = duration_slots + transition_slots
                 interval = model.NewFixedSizeIntervalVar(
                     start_var,
-                    buffered_duration,
+                    duration_slots,
                     f"interval_{name}",
                 )
                 all_intervals.append(interval)
@@ -188,7 +188,7 @@ class WeeklyOptimizer:
                 model.AddElement(start_var, preference_table, pref_var)
                 objective_terms.append(self.config.weights.preferred_window * pref_var)
 
-                if request.protect_weekend:
+                if request.protect_weekend and task.counts_toward_daily_limit:
                     weekend_table = self._weekend_table(request, horizon_slots)
                     weekend_var = model.NewIntVar(0, 1, f"weekend_{name}")
                     model.AddElement(start_var, weekend_table, weekend_var)
@@ -230,26 +230,28 @@ class WeeklyOptimizer:
             task_sessions_by_id,
             horizon_days,
         )
-
-        if sessions and self.config.weights.daily_load_imbalance > 0:
-            daily_load_vars = []
-            max_possible_load = sum(session.duration_slots for session in sessions) + sum(fixed_daily_load)
-            for day in range(horizon_days):
-                load = model.NewIntVar(0, max_possible_load, f"daily_load_{day}")
-                terms = [fixed_daily_load[day]]
-                terms.extend(
-                    session.duration_slots * session.day_flags[day]
-                    for session in sessions
-                )
-                model.Add(load == sum(terms))
-                daily_load_vars.append(load)
-            max_load = model.NewIntVar(0, max_possible_load, "max_daily_load")
-            min_load = model.NewIntVar(0, max_possible_load, "min_daily_load")
-            model.AddMaxEquality(max_load, daily_load_vars)
-            model.AddMinEquality(min_load, daily_load_vars)
-            imbalance = model.NewIntVar(0, max_possible_load, "daily_load_imbalance")
-            model.Add(imbalance == max_load - min_load)
-            objective_terms.append(self.config.weights.daily_load_imbalance * imbalance)
+        self._add_pairwise_transitions_and_spreading(
+            model,
+            sessions,
+            request,
+            objective_terms,
+        )
+        self._add_compact_sequence_objective(
+            model,
+            active_tasks,
+            task_sessions_by_id,
+            horizon_days,
+            request,
+            objective_terms,
+            horizon_slots,
+        )
+        daily_load_vars = self._add_daily_workload_objective(
+            model,
+            sessions,
+            horizon_days,
+            request,
+            objective_terms,
+        )
 
         if objective_terms:
             model.Minimize(sum(objective_terms))
@@ -290,6 +292,10 @@ class WeeklyOptimizer:
             )
 
         generated_events.sort(key=lambda event: (event.start, event.end, event.task_id))
+        daily_load_minutes = [
+            solver.Value(load) * slot_minutes
+            for load in daily_load_vars
+        ]
         return OptimizationResult(
             status=status,
             events=tuple(generated_events),
@@ -301,6 +307,9 @@ class WeeklyOptimizer:
                 "num_branches": solver.NumBranches(),
                 "best_objective_bound": solver.BestObjectiveBound() if objective_terms else 0.0,
                 "session_count": len(sessions),
+                "daily_flexible_load_minutes": daily_load_minutes,
+                "preferred_daily_flexible_min": request.preferred_daily_flexible_min,
+                "max_daily_flexible_min": request.max_daily_flexible_min,
             },
         )
 
@@ -331,6 +340,138 @@ class WeeklyOptimizer:
                                 earlier_session.day_flags[day],
                                 later_session.day_flags[day],
                             ])
+
+    def _add_pairwise_transitions_and_spreading(
+        self,
+        model: cp_model.CpModel,
+        sessions: Sequence[_SessionVariable],
+        request: PlanRequest,
+        objective_terms: List[cp_model.LinearExpr],
+    ) -> None:
+        for left_index in range(len(sessions)):
+            left = sessions[left_index]
+            for right_index in range(left_index + 1, len(sessions)):
+                right = sessions[right_index]
+                same_day = model.NewBoolVar(
+                    f"same_day_{self._safe_name(left.task.id)}_{left.index}_"
+                    f"{self._safe_name(right.task.id)}_{right.index}"
+                )
+                model.Add(left.day == right.day).OnlyEnforceIf(same_day)
+                model.Add(left.day != right.day).OnlyEnforceIf(same_day.Not())
+
+                if (
+                    left.task.id == right.task.id
+                    and left.task.prefer_distinct_session_days
+                ):
+                    objective_terms.append(self.config.weights.same_day_sessions * same_day)
+
+                left_before = model.NewBoolVar(
+                    f"before_{self._safe_name(left.task.id)}_{left.index}_"
+                    f"{self._safe_name(right.task.id)}_{right.index}"
+                )
+                buffer_left_right = self._transition_slots(left.task, right.task, request)
+                buffer_right_left = self._transition_slots(right.task, left.task, request)
+                model.Add(
+                    left.end + buffer_left_right <= right.start
+                ).OnlyEnforceIf([same_day, left_before])
+                model.Add(
+                    right.end + buffer_right_left <= left.start
+                ).OnlyEnforceIf([same_day, left_before.Not()])
+
+    def _add_compact_sequence_objective(
+        self,
+        model: cp_model.CpModel,
+        tasks: Sequence[PlanningTask],
+        task_sessions_by_id: Dict[str, List[_SessionVariable]],
+        horizon_days: int,
+        request: PlanRequest,
+        objective_terms: List[cp_model.LinearExpr],
+        horizon_slots: int,
+    ) -> None:
+        groups: Dict[str, List[PlanningTask]] = {}
+        for task in tasks:
+            if (
+                task.sequence_group
+                and task.daily_sequence_rank is not None
+                and task_sessions_by_id.get(task.id)
+            ):
+                groups.setdefault(task.sequence_group, []).append(task)
+
+        compact_slots = self._minutes_to_slots(request.compact_gap_min, request.slot_minutes)
+        for group_name, group_tasks in groups.items():
+            ranks = sorted({int(task.daily_sequence_rank) for task in group_tasks})
+            for earlier_rank, later_rank in zip(ranks, ranks[1:]):
+                earlier_tasks = [task for task in group_tasks if int(task.daily_sequence_rank) == earlier_rank]
+                later_tasks = [task for task in group_tasks if int(task.daily_sequence_rank) == later_rank]
+                for earlier_task in earlier_tasks:
+                    for later_task in later_tasks:
+                        for earlier_session in task_sessions_by_id[earlier_task.id]:
+                            for later_session in task_sessions_by_id[later_task.id]:
+                                for day in range(horizon_days):
+                                    both = model.NewBoolVar(
+                                        f"compact_{self._safe_name(group_name)}_{day}_"
+                                        f"{self._safe_name(earlier_task.id)}_{earlier_session.index}_"
+                                        f"{self._safe_name(later_task.id)}_{later_session.index}"
+                                    )
+                                    earlier_flag = earlier_session.day_flags[day]
+                                    later_flag = later_session.day_flags[day]
+                                    model.Add(both <= earlier_flag)
+                                    model.Add(both <= later_flag)
+                                    model.Add(both >= earlier_flag + later_flag - 1)
+
+                                    gap = model.NewIntVar(0, horizon_slots, f"gap_{both.Name()}")
+                                    model.Add(
+                                        gap == later_session.start - earlier_session.end
+                                    ).OnlyEnforceIf(both)
+                                    model.Add(gap == 0).OnlyEnforceIf(both.Not())
+                                    objective_terms.append(self.config.weights.compact_gap * gap)
+
+                                    excess = model.NewIntVar(0, horizon_slots, f"excess_{both.Name()}")
+                                    model.Add(excess >= gap - compact_slots)
+                                    objective_terms.append(
+                                        self.config.weights.compact_gap_excess * excess
+                                    )
+
+    def _add_daily_workload_objective(
+        self,
+        model: cp_model.CpModel,
+        sessions: Sequence[_SessionVariable],
+        horizon_days: int,
+        request: PlanRequest,
+        objective_terms: List[cp_model.LinearExpr],
+    ) -> List[cp_model.IntVar]:
+        productive = [session for session in sessions if session.task.counts_toward_daily_limit]
+        max_possible = max(1, sum(session.duration_slots for session in productive))
+        hard_max_slots = max(1, request.max_daily_flexible_min // request.slot_minutes)
+        target_slots = max(0, request.preferred_daily_flexible_min // request.slot_minutes)
+        daily_load_vars: List[cp_model.IntVar] = []
+
+        for day in range(horizon_days):
+            load = model.NewIntVar(0, max_possible, f"daily_flexible_load_{day}")
+            terms = [
+                session.duration_slots * session.day_flags[day]
+                for session in productive
+            ]
+            model.Add(load == sum(terms) if terms else 0)
+            model.Add(load <= hard_max_slots)
+            daily_load_vars.append(load)
+
+            overload = model.NewIntVar(0, max_possible, f"daily_overload_{day}")
+            model.Add(overload >= load - target_slots)
+            objective_terms.append(self.config.weights.daily_overload * overload)
+
+        balance_days = list(range(min(5, horizon_days))) if request.protect_weekend else list(range(horizon_days))
+        if len(balance_days) > 1:
+            balanced_loads = [daily_load_vars[day] for day in balance_days]
+            max_load = model.NewIntVar(0, max_possible, "max_daily_flexible_load")
+            min_load = model.NewIntVar(0, max_possible, "min_daily_flexible_load")
+            model.AddMaxEquality(max_load, balanced_loads)
+            model.AddMinEquality(min_load, balanced_loads)
+            imbalance = model.NewIntVar(0, max_possible, "daily_flexible_imbalance")
+            model.Add(imbalance == max_load - min_load)
+            objective_terms.append(self.config.weights.daily_load_imbalance * imbalance)
+
+        return daily_load_vars
 
     def _decompose_task(self, task: PlanningTask, slot_minutes: int) -> List[int]:
         if task.total_duration_min % slot_minutes != 0:
@@ -392,7 +533,10 @@ class WeeklyOptimizer:
                 continue
             if minute_of_day + duration_min > request.sleep_min:
                 continue
-            if any(max(start_slot, busy_start) < min(end_slot, busy_end) for busy_start, busy_end in fixed_busy_ranges):
+            if any(
+                max(start_slot, busy_start) < min(end_slot, busy_end)
+                for busy_start, busy_end in fixed_busy_ranges
+            ):
                 continue
             allowed.append(start_slot)
         return allowed
@@ -468,6 +612,31 @@ class WeeklyOptimizer:
             * max(1, window.weight)
             * direction_multiplier
         )
+
+    def _transition_slots(
+        self,
+        source: PlanningTask,
+        destination: PlanningTask,
+        request: PlanRequest,
+    ) -> int:
+        minutes = max(
+            source.transition_after_min,
+            self._travel_minutes(source.location, destination.location, request),
+        )
+        return self._minutes_to_slots(minutes, request.slot_minutes)
+
+    @staticmethod
+    def _travel_minutes(source: str, destination: str, request: PlanRequest) -> int:
+        source = str(source or "any").strip().lower()
+        destination = str(destination or "any").strip().lower()
+        if source == destination or source in {"", "any"} or destination in {"", "any"}:
+            return 0
+        for left, right, minutes in request.travel_time_overrides:
+            left = str(left).strip().lower()
+            right = str(right).strip().lower()
+            if (source, destination) in {(left, right), (right, left)}:
+                return int(minutes)
+        return int(request.default_travel_min)
 
     def _weekend_table(self, request: PlanRequest, horizon_slots: int) -> List[int]:
         return [

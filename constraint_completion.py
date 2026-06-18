@@ -3,6 +3,7 @@ from typing import Dict, List, Optional, Tuple
 
 from models import DAY_NAMES, DAY_TO_INDEX, Event, Task, UnscheduledTask
 from parser_utils import hhmm_to_minutes
+from routine_utils import repair_routine_windows
 
 
 def _norm_tokens(text: str):
@@ -285,11 +286,7 @@ def complete_schedule_constraints(
     anchors: List[Task],
     settings: Dict,
 ) -> Tuple[List[Task], List[Event], List[UnscheduledTask]]:
-    """Deterministically complete deficits left after AI repair passes.
-
-    This layer does not redesign the AI plan. It only enforces remaining hard
-    constraints: exact durations, recurring counts, and dependency order.
-    """
+    """Deterministically complete deficits left after AI repair passes."""
     tasks = list(tasks)
     events = list(events)
     unscheduled = list(unscheduled)
@@ -364,5 +361,11 @@ def complete_schedule_constraints(
                 category=task.category,
             ))
 
+    tasks, events, unscheduled = repair_routine_windows(
+        tasks,
+        events,
+        unscheduled,
+        settings,
+    )
     events.sort(key=lambda event: (event.day_index, event.start_min, event.end_min, event.title))
     return tasks, events, unscheduled

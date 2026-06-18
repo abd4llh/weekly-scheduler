@@ -17,6 +17,7 @@ DEFAULT_DAILY_MAX_MIN = 10 * 60
 DEFAULT_TOTAL_BURDEN_TARGET_MIN = 10 * 60
 DEFAULT_FOCUSED_WORK_TARGET_MIN = 4 * 60
 DEFAULT_LATE_FOCUS_START_MIN = 19 * 60
+DEFAULT_FLEXIBLE_START_MIN = 9 * 60
 DEFAULT_TRAVEL_MIN = 20
 DEFAULT_COMPACT_GAP_MIN = 30
 
@@ -71,6 +72,7 @@ def optimize_legacy_week(tasks: Sequence[Task], week_start: date | datetime, set
         preferred_daily_total_min=int(settings.get("preferred_daily_total_min", DEFAULT_TOTAL_BURDEN_TARGET_MIN)),
         preferred_daily_focus_min=int(settings.get("preferred_daily_focus_min", DEFAULT_FOCUSED_WORK_TARGET_MIN)),
         late_focus_start_min=int(settings.get("late_focus_start_min", DEFAULT_LATE_FOCUS_START_MIN)),
+        default_flexible_start_min=int(settings.get("default_flexible_start_min", DEFAULT_FLEXIBLE_START_MIN)),
         default_travel_min=int(settings.get("default_travel_min", DEFAULT_TRAVEL_MIN)),
         compact_gap_min=int(settings.get("compact_gap_min", DEFAULT_COMPACT_GAP_MIN)),
         timezone=str(settings.get("timezone", "Europe/Berlin")),
@@ -120,6 +122,7 @@ def optimize_legacy_week(tasks: Sequence[Task], week_start: date | datetime, set
         "preferred_daily_total_min": request.preferred_daily_total_min,
         "preferred_daily_focus_min": request.preferred_daily_focus_min,
         "late_focus_start_min": request.late_focus_start_min,
+        "default_flexible_start_min": int(settings.get("default_flexible_start_min", DEFAULT_FLEXIBLE_START_MIN)),
         "default_travel_min": request.default_travel_min,
         "compact_gap_min": request.compact_gap_min,
     }

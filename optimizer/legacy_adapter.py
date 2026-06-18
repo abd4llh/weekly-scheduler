@@ -26,6 +26,8 @@ ROUTINE_SEQUENCE_RANK = {
     "evening wind-down": 95,
 }
 
+MEAL_TITLES = {"breakfast", "lunch", "dinner"}
+
 DEFAULT_TRAVEL_OVERRIDES = (
     ("home", "studio", 10),
     ("studio", "store", 20),
@@ -119,7 +121,6 @@ def _routine_windows(settings: Dict | None) -> Dict[str, Tuple[TimeWindow, ...]]
     if not settings:
         return {}
     output = {}
-    meal_titles = {"Breakfast", "Lunch", "Dinner"}
     breakfast_target = hhmm_to_minutes(str(settings.get("breakfast_preferred_time", "")))
     for requirement in routine_requirements_from_settings(settings):
         title = requirement["title"]
@@ -151,11 +152,19 @@ def _routine_windows(settings: Dict | None) -> Dict[str, Tuple[TimeWindow, ...]]
                 weight=4,
                 preferred_start_min=preferred,
                 outside_penalty=24,
-                prefer_later_fallback=title in meal_titles,
+                prefer_later_fallback=title.strip().lower() in MEAL_TITLES,
             )
             for day in range(7)
         )
     return output
+
+
+def _routine_hard_earliest(task: LegacyTask, routine_windows: Dict[str, Tuple[TimeWindow, ...]]) -> int | None:
+    title = task.title.strip().lower()
+    windows = routine_windows.get(title, ())
+    if title not in MEAL_TITLES or not windows:
+        return None
+    return int(windows[0].start_min)
 
 
 def _daily_sequence_rank(task: LegacyTask) -> int | None:
@@ -178,14 +187,56 @@ def _sequence_group(task: LegacyTask) -> str:
     return ""
 
 
+def _counts_as_focused_work(task: LegacyTask) -> bool:
+    if task.category in {"Routine", "Admin", "Home", "Relationship", "Social", "Health"}:
+        return False
+    text = f"{task.title} {task.notes}".lower()
+    if any(word in text for word in ["meeting", "market", "visit", "shopping", "clean", "instagram"]):
+        return False
+    if str(task.energy or "").lower() in {"high", "creative"}:
+        return True
+    if task.category in {"Lab", "Writing", "Focus"}:
+        return True
+    return any(
+        word in text
+        for word in [
+            "painting", "paint ", "watercolor", "write", "draft", "analysis",
+            "analyze", "experiment", "research", "coding", "programming", "design",
+        ]
+    )
+
+
 def _transition_after(task: LegacyTask, transition_min: int) -> int:
-    if transition_min <= 0 or task.category == "Routine":
+    if task.category == "Routine":
+        return 0
+    if _counts_as_focused_work(task) and int(task.duration_min) >= 180:
+        return max(int(transition_min), 30)
+    if transition_min <= 0:
         return 0
     if task.task_type == "Fixed":
         return transition_min
     if str(task.energy or "").lower() in {"high", "physical", "creative"}:
         return transition_min
     return 0
+
+
+def _location_from_text(text: str, category: str = "") -> str:
+    text = str(text or "").lower()
+    if any(word in text for word in ["art supply", "supply store", "grocery", "groceries", "shop", "store"]):
+        return "store"
+    if any(word in text for word in ["studio", "painting", "paint ", "watercolor", "sketch", "varnish", "artwork"]):
+        return "studio"
+    if any(word in text for word in ["laboratory", " lab ", "experiment", "sensor"]):
+        return "lab"
+    if any(word in text for word in ["gym", "workout", "exercise", "training"]):
+        return "gym"
+    if any(word in text for word in ["office", "workplace"]):
+        return "office"
+    if any(word in text for word in ["market", "doctor", "appointment", "client meeting", "meet with"]):
+        return "outside"
+    if category == "Routine" or any(word in text for word in ["cook", "laundry", "house", "home"]):
+        return "home"
+    return "any"
 
 
 def _effective_location(task: LegacyTask) -> str:
@@ -199,23 +250,11 @@ def _effective_location(task: LegacyTask) -> str:
     explicit = aliases.get(explicit, explicit)
     if explicit not in {"", "any"}:
         return explicit
+    return _location_from_text(f"{task.title} {task.notes}", task.category)
 
-    text = f"{task.title} {task.notes}".lower()
-    if any(word in text for word in ["art supply", "supply store", "grocery", "groceries", "shop", "store"]):
-        return "store"
-    if any(word in text for word in ["studio", "painting", "paint ", "watercolor", "sketch", "varnish", "artwork"]):
-        return "studio"
-    if any(word in text for word in ["laboratory", " lab ", "experiment", "sensor"]):
-        return "lab"
-    if any(word in text for word in ["gym", "workout", "exercise", "training"]):
-        return "gym"
-    if any(word in text for word in ["office", "workplace"]):
-        return "office"
-    if any(word in text for word in ["market", "doctor", "appointment", "client meeting", "meet with"]):
-        return "outside"
-    if task.category == "Routine" or any(word in text for word in ["cook", "laundry", "house", "home"]):
-        return "home"
-    return "any"
+
+def _event_location(event: LegacyEvent) -> str:
+    return _location_from_text(f"{event.title} {event.notes}", event.category)
 
 
 def legacy_tasks_to_plan_request(
@@ -230,13 +269,16 @@ def legacy_tasks_to_plan_request(
     transition_min: int = 0,
     preferred_daily_flexible_min: int = 8 * 60,
     max_daily_flexible_min: int = 10 * 60,
+    preferred_daily_total_min: int = 10 * 60,
+    preferred_daily_focus_min: int = 4 * 60,
+    late_focus_start_min: int = 19 * 60,
     default_travel_min: int = 20,
     compact_gap_min: int = 30,
     travel_time_overrides: Tuple[Tuple[str, str, int], ...] = DEFAULT_TRAVEL_OVERRIDES,
     timezone: str = "Europe/Berlin",
     routine_settings: Dict | None = None,
 ) -> PlanRequest:
-    """Convert the current app's Task/Event objects into the v0.12 domain model."""
+    """Convert the current app's Task/Event objects into the optimizer domain model."""
 
     if week_start.hour or week_start.minute or week_start.second or week_start.microsecond:
         week_start = datetime.combine(week_start.date(), time.min, tzinfo=week_start.tzinfo)
@@ -301,8 +343,8 @@ def legacy_tasks_to_plan_request(
             task.title.strip().lower(),
             _preferred_windows(task, wake_min, sleep_min),
         )
-
         requested_sessions = sessions if (is_recurring or (is_multi_session and sessions > 1)) else None
+
         canonical_tasks.append(
             PlanningTask(
                 id=task_id,
@@ -315,6 +357,7 @@ def legacy_tasks_to_plan_request(
                 fixed_end=fixed_end,
                 required_weekdays=required_days,
                 preferred_windows=preferred_windows,
+                hard_earliest_min_of_day=_routine_hard_earliest(task, routine_windows),
                 dependencies=dependencies,
                 min_block_min=max(slot_minutes, int(task.min_block_min or slot_minutes)),
                 max_block_min=max(slot_minutes, int(task.max_block_min or total_duration)),
@@ -328,7 +371,9 @@ def legacy_tasks_to_plan_request(
                 daily_sequence_rank=_daily_sequence_rank(task),
                 sequence_group=_sequence_group(task),
                 transition_after_min=_transition_after(task, transition_min),
-                counts_toward_daily_limit=task.category != "Routine",
+                counts_toward_daily_limit=task.category != "Routine" and task.task_type != "Fixed",
+                counts_toward_total_burden=True,
+                counts_as_focused_work=_counts_as_focused_work(task),
             )
         )
 
@@ -341,6 +386,8 @@ def legacy_tasks_to_plan_request(
             locked=True,
             busy=True,
             source=EventSource.IMPORTED,
+            location=_event_location(event),
+            counts_toward_total_burden=True,
         )
         for index, event in enumerate(existing_events)
     )
@@ -357,6 +404,9 @@ def legacy_tasks_to_plan_request(
         transition_min=transition_min,
         preferred_daily_flexible_min=preferred_daily_flexible_min,
         max_daily_flexible_min=max_daily_flexible_min,
+        preferred_daily_total_min=preferred_daily_total_min,
+        preferred_daily_focus_min=preferred_daily_focus_min,
+        late_focus_start_min=late_focus_start_min,
         default_travel_min=default_travel_min,
         compact_gap_min=compact_gap_min,
         travel_time_overrides=travel_time_overrides,

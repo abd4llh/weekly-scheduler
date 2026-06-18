@@ -41,6 +41,7 @@ class TimeWindow:
     end_min: int
     weekday: Optional[int] = None
     weight: int = 1
+    prefer_later_fallback: bool = False
 
     def __post_init__(self) -> None:
         if not 0 <= self.start_min < self.end_min <= 24 * 60:

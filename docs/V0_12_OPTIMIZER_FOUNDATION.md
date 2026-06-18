@@ -2,7 +2,7 @@
 
 Development branch: `feature/v0.12-optimizer-foundation`
 
-Draft pull request: `#1 — v0.12 optimizer foundation`
+Draft pull request: `#1 — v0.12 optimizer foundation and Streamlit preview`
 
 ## Objective
 
@@ -20,11 +20,11 @@ Natural-language input
 
 The existing `main` branch remains the stable legacy application while this branch is developed.
 
-## Implemented in the first foundation milestone
+## Implemented
 
 - Canonical domain models for projects, tasks, events, plans and revisions
-- OR-Tools dependency
-- Single-week CP-SAT optimizer
+- OR-Tools CP-SAT single-week optimizer
+- Streamlit planning-engine selector and optimizer preview
 - Exact task-duration decomposition into sessions
 - Fixed events and fixed tasks
 - No-overlap constraints
@@ -32,38 +32,59 @@ The existing `main` branch remains the stable legacy application while this bran
 - Required weekdays
 - Earliest-start and deadline limits
 - Wake/sleep boundaries
-- Preferred time-window penalties
+- Preferred time-window targets and fallback penalties
+- Recurring sessions on distinct days
+- Quantity-aware multi-session deliverables
 - Weekend-protection penalty
-- Daily-load balancing objective
+- Daily flexible-work target and hard maximum
+- Stronger daily workload balancing
+- Soft distribution of multi-session deliverables across days
+- Location inference and sequence-dependent travel buffers
+- Transition buffers around fixed commitments
+- Compact morning routine sequencing
 - Adapter from the current `models.Task` / `models.Event` objects
-- Unit tests and branch-specific GitHub Actions workflow
-- Passing optimizer and legacy-adapter test suite
+- Optimizer diagnostics in the Streamlit calendar
+- Automated tests and branch-specific GitHub Actions workflow
 
-## Hard constraints in the current solver
+## Current hard constraints
 
 - Fixed task times
 - Imported busy events
 - No forbidden overlaps
 - Exact total duration
-- Exact requested session count
+- Exact requested recurring-session count
+- Recurring sessions on distinct days
 - Wake and sleep limits
 - Required weekdays
 - Earliest start
 - Deadline
 - Task dependency order
+- Daily flexible-work hard maximum
+- Required transition/travel time between applicable events
 
-## Soft constraints in the current solver
+## Current soft constraints
 
-- Preferred time windows
+- Preferred time windows and preferred start points
+- Later-first meal fallback
 - Weekend avoidance when enabled
-- Earlier placement
+- Earlier placement when no preference exists
+- Preferred daily workload target
 - Balanced daily workload
+- Multi-session distribution across days
+- Compact gaps between morning routine, breakfast and morning practice
+
+## Default schedule-quality values
+
+- Preferred flexible workload: 8 hours per day
+- Hard flexible-work maximum: 10 hours per day
+- Default travel time between different known locations: 20 minutes
+- Compact morning-sequence gap: no more than 30 minutes preferred
+
+Fixed commitments and automatic routines are excluded from the flexible-work ceiling.
 
 ## Not implemented yet
 
 - Optional task omission with priority penalties
-- Flexible meal/routine preference objects in the canonical model
-- Transition-time constraints between locations or demanding tasks
 - Locked manually moved optimizer events
 - Partial replanning scopes
 - Multi-week project allocation
@@ -71,9 +92,9 @@ The existing `main` branch remains the stable legacy application while this bran
 - Persistence and revision history
 - Alternative schedule generation
 
-## Next implementation milestone
+## Next milestone
 
-1. Add an experimental optimizer mode to the Streamlit application on this branch.
-2. Compare the optimizer against the existing painter and personal-workload test prompts.
-3. Add explicit soft-routine windows and schedule-change penalties.
-4. Begin the interactive calendar component only after optimizer output is stable.
+1. Stress-test the schedule-quality model on painter, laboratory, student and household scenarios.
+2. Tune objective weights and defaults from those results.
+3. Start the interactive calendar component with drag, resize and lock support.
+4. Add selective replanning that preserves completed, fixed and user-locked events.

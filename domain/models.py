@@ -99,12 +99,15 @@ class PlanningTask:
     max_block_min: int = 180
     sessions_required: Optional[int] = None
     distinct_session_days: bool = False
+    prefer_distinct_session_days: bool = False
     splittable: bool = True
     energy: str = "medium"
     location: str = "any"
     locked: bool = False
     daily_sequence_rank: Optional[int] = None
+    sequence_group: str = ""
     transition_after_min: int = 0
+    counts_toward_daily_limit: bool = True
 
     def __post_init__(self) -> None:
         if not self.id.strip() or not self.title.strip():
@@ -121,6 +124,8 @@ class PlanningTask:
             raise ValueError("sessions_required must be positive when provided.")
         if self.distinct_session_days and self.sessions_required is None:
             raise ValueError("distinct_session_days requires sessions_required.")
+        if self.prefer_distinct_session_days and self.sessions_required is None:
+            raise ValueError("prefer_distinct_session_days requires sessions_required.")
         if any(day not in range(7) for day in self.required_weekdays):
             raise ValueError("required_weekdays values must be between 0 and 6.")
         if (self.fixed_start is None) != (self.fixed_end is None):
@@ -188,6 +193,11 @@ class PlanRequest:
     sleep_min: int = 23 * 60
     protect_weekend: bool = False
     transition_min: int = 0
+    preferred_daily_flexible_min: int = 8 * 60
+    max_daily_flexible_min: int = 10 * 60
+    default_travel_min: int = 20
+    compact_gap_min: int = 30
+    travel_time_overrides: Tuple[Tuple[str, str, int], ...] = ()
     timezone: str = "Europe/Berlin"
 
     def __post_init__(self) -> None:
@@ -199,6 +209,17 @@ class PlanRequest:
             raise ValueError("Wake/sleep minutes must satisfy 0 <= wake < sleep <= 1440.")
         if self.transition_min < 0:
             raise ValueError("transition_min cannot be negative.")
+        if self.preferred_daily_flexible_min < 0:
+            raise ValueError("preferred_daily_flexible_min cannot be negative.")
+        if self.max_daily_flexible_min <= 0:
+            raise ValueError("max_daily_flexible_min must be positive.")
+        if self.preferred_daily_flexible_min > self.max_daily_flexible_min:
+            raise ValueError("Preferred daily load cannot exceed the hard daily maximum.")
+        if self.default_travel_min < 0 or self.compact_gap_min < 0:
+            raise ValueError("Travel and compact-gap settings cannot be negative.")
+        for source, destination, minutes in self.travel_time_overrides:
+            if not str(source).strip() or not str(destination).strip() or minutes < 0:
+                raise ValueError("Invalid travel-time override.")
         task_ids = [task.id for task in self.tasks]
         if len(task_ids) != len(set(task_ids)):
             raise ValueError("Task ids must be unique within a plan request.")

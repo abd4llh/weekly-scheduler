@@ -31,7 +31,12 @@ def _clamp_target(start_min: int, end_min: int, target_min: int, duration_min: i
     return min(max(target_min, start_min), max(start_min, end_min - duration_min))
 
 
-def _preferred_windows(task: LegacyTask, wake_min: int, sleep_min: int) -> Tuple[TimeWindow, ...]:
+def _preferred_windows(
+    task: LegacyTask,
+    wake_min: int,
+    sleep_min: int,
+    default_flexible_start_min: int,
+) -> Tuple[TimeWindow, ...]:
     preferred = str(task.preferred_time or "Any")
     day = _day_index(task.required_day or task.fixed_day)
     weekdays = (day,) if day is not None else (None,)
@@ -41,16 +46,36 @@ def _preferred_windows(task: LegacyTask, wake_min: int, sleep_min: int) -> Tuple
         "Workday": (max(540, wake_min), min(1020, sleep_min), 600),
         "Afternoon": (max(780, wake_min), min(1080, sleep_min), 870),
         "Evening": (max(1080, wake_min), min(1320, sleep_min), 1140),
+        "Any": (wake_min, sleep_min, default_flexible_start_min),
     }
     if preferred == "Weekend":
-        return tuple(TimeWindow(wake_min, sleep_min, weekday=d, preferred_start_min=_clamp_target(wake_min, sleep_min, 600, duration), outside_penalty=16) for d in (5, 6))
+        return tuple(
+            TimeWindow(
+                wake_min,
+                sleep_min,
+                weekday=d,
+                preferred_start_min=_clamp_target(wake_min, sleep_min, max(600, default_flexible_start_min), duration),
+                outside_penalty=16,
+            )
+            for d in (5, 6)
+        )
     if preferred not in settings:
         return ()
     start, end, target = settings[preferred]
     if end <= start:
         return ()
     target = _clamp_target(start, end, target, duration)
-    return tuple(TimeWindow(start, end, weekday=d, preferred_start_min=target, outside_penalty=16) for d in weekdays)
+    outside_penalty = 0 if preferred == "Any" else 16
+    return tuple(
+        TimeWindow(
+            start,
+            end,
+            weekday=d,
+            preferred_start_min=target,
+            outside_penalty=outside_penalty,
+        )
+        for d in weekdays
+    )
 
 
 def _routine_windows(settings: Dict | None):
@@ -66,7 +91,18 @@ def _routine_windows(settings: Dict | None):
         preferred = _clamp_target(start, end, int(requirement["preferred_start_min"]), duration)
         if title == "Morning routine" and settings.get("breakfast_enabled") and breakfast_target is not None:
             preferred = _clamp_target(start, end, breakfast_target - duration, duration)
-        output[title.lower()] = tuple(TimeWindow(start, end, weekday=d, weight=4, preferred_start_min=preferred, outside_penalty=24, prefer_later_fallback=title.lower() in MEAL_TITLES) for d in range(7))
+        output[title.lower()] = tuple(
+            TimeWindow(
+                start,
+                end,
+                weekday=d,
+                weight=4,
+                preferred_start_min=preferred,
+                outside_penalty=24,
+                prefer_later_fallback=title.lower() in MEAL_TITLES,
+            )
+            for d in range(7)
+        )
     return output
 
 
@@ -104,6 +140,7 @@ def legacy_tasks_to_plan_request(
     preferred_daily_total_min: int = 600,
     preferred_daily_focus_min: int = 240,
     late_focus_start_min: int = 1140,
+    default_flexible_start_min: int = 540,
     default_travel_min: int = 20,
     compact_gap_min: int = 30,
     travel_time_overrides: Tuple[Tuple[str, str, int], ...] = (),
@@ -149,7 +186,10 @@ def legacy_tasks_to_plan_request(
         requested_sessions = session_count if recurring or (multi and session_count > 1) else None
         distinct, prefer_distinct, prefer_same = _distribution_flags(task, recurring, requested_sessions)
         title_key = task.title.strip().lower()
-        windows = routine_windows.get(title_key, _preferred_windows(task, wake_min, sleep_min))
+        windows = routine_windows.get(
+            title_key,
+            _preferred_windows(task, wake_min, sleep_min, default_flexible_start_min),
+        )
         hard_earliest = windows[0].start_min if title_key in MEAL_TITLES and windows else None
         demanding = task.cognitive_load == "High" or task.physical_load == "High"
         recovery = max(int(task.recovery_min or 0), int(transition_min) if demanding or task.task_type == "Fixed" else 0)

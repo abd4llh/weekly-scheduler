@@ -25,6 +25,7 @@ def test_recurring_duration_is_converted_to_weekly_total():
     assert task.sessions_required == 3
     assert task.distinct_session_days is True
     assert task.splittable is True
+    assert task.preferred_windows[0].preferred_start_min is not None
 
 
 def test_fixed_task_and_existing_event_are_converted():
@@ -43,16 +44,17 @@ def test_fixed_task_and_existing_event_are_converted():
         end_min=17 * 60,
     )
 
-    request = legacy_tasks_to_plan_request([doctor], WEEK_START, [busy])
+    request = legacy_tasks_to_plan_request([doctor], WEEK_START, [busy], transition_min=15)
     task = request.tasks[0]
 
     assert task.fixed_start == datetime(2026, 6, 21, 14, 0)
     assert task.fixed_end == datetime(2026, 6, 21, 15, 0)
+    assert task.transition_after_min == 15
     assert request.existing_events[0].start == datetime(2026, 6, 17, 16, 0)
     assert request.existing_events[0].end == datetime(2026, 6, 17, 17, 0)
 
 
-def test_meal_settings_create_preferred_and_later_fallback_windows():
+def test_meal_settings_create_daily_targeted_preference_windows():
     lunch = Task(
         title="Lunch",
         duration_min=45,
@@ -83,11 +85,9 @@ def test_meal_settings_create_preferred_and_later_fallback_windows():
     )
     task = request.tasks[0]
 
-    assert len(task.preferred_windows) == 14
-    preferred = [window for window in task.preferred_windows if window.weight == 4]
-    fallback = [window for window in task.preferred_windows if window.weight == 1]
-    assert {window.weekday for window in preferred} == set(range(7))
-    assert all(window.start_min == 11 * 60 for window in preferred)
-    assert all(window.end_min == 14 * 60 for window in preferred)
-    assert all(window.start_min == 14 * 60 for window in fallback)
-    assert all(window.end_min == 23 * 60 for window in fallback)
+    assert len(task.preferred_windows) == 7
+    assert {window.weekday for window in task.preferred_windows} == set(range(7))
+    assert all(window.start_min == 11 * 60 for window in task.preferred_windows)
+    assert all(window.end_min == 14 * 60 for window in task.preferred_windows)
+    assert all(window.preferred_start_min == 13 * 60 for window in task.preferred_windows)
+    assert all(window.prefer_later_fallback for window in task.preferred_windows)

@@ -31,16 +31,21 @@ class EventSource(str, Enum):
 
 @dataclass(frozen=True)
 class TimeWindow:
-    """A preferred or allowed time window expressed as minutes after midnight.
+    """A weighted preferred time window in minutes after midnight.
 
     ``weekday`` follows Python's convention: Monday=0 ... Sunday=6. When it is
-    ``None``, the window applies to every day in the planning horizon.
+    ``None``, the preference applies every day. ``preferred_start_min`` gives
+    the optimizer an ideal point inside the window instead of treating every
+    legal time equally. ``prefer_later_fallback`` makes a time after a blocked
+    window preferable to an equally distant time before it.
     """
 
     start_min: int
     end_min: int
     weekday: Optional[int] = None
     weight: int = 1
+    preferred_start_min: Optional[int] = None
+    outside_penalty: int = 12
     prefer_later_fallback: bool = False
 
     def __post_init__(self) -> None:
@@ -48,8 +53,11 @@ class TimeWindow:
             raise ValueError("TimeWindow must satisfy 0 <= start < end <= 1440.")
         if self.weekday is not None and self.weekday not in range(7):
             raise ValueError("weekday must be between 0 and 6.")
-        if self.weight < 0:
-            raise ValueError("weight must be non-negative.")
+        if self.weight < 0 or self.outside_penalty < 0:
+            raise ValueError("Time-window penalty weights must be non-negative.")
+        if self.preferred_start_min is not None:
+            if not self.start_min <= self.preferred_start_min < self.end_min:
+                raise ValueError("preferred_start_min must be inside the time window.")
 
 
 @dataclass(frozen=True)
@@ -95,6 +103,8 @@ class PlanningTask:
     energy: str = "medium"
     location: str = "any"
     locked: bool = False
+    daily_sequence_rank: Optional[int] = None
+    transition_after_min: int = 0
 
     def __post_init__(self) -> None:
         if not self.id.strip() or not self.title.strip():
@@ -123,6 +133,10 @@ class PlanningTask:
                 raise ValueError("Fixed task duration must match total_duration_min.")
         if self.earliest_start and self.deadline and self.deadline <= self.earliest_start:
             raise ValueError("deadline must be after earliest_start.")
+        if self.daily_sequence_rank is not None and self.daily_sequence_rank < 0:
+            raise ValueError("daily_sequence_rank cannot be negative.")
+        if self.transition_after_min < 0:
+            raise ValueError("transition_after_min cannot be negative.")
 
 
 @dataclass(frozen=True)

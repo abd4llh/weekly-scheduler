@@ -592,7 +592,10 @@ class WeeklyOptimizer:
                 session.duration_slots * session.day_flags[day]
                 for session in productive
             ]
-            model.Add(flexible_load == sum(flexible_terms) if flexible_terms else 0)
+            if flexible_terms:
+                model.Add(flexible_load == sum(flexible_terms))
+            else:
+                model.Add(flexible_load == 0)
             model.Add(flexible_load <= hard_max_slots)
             flexible_loads.append(flexible_load)
 

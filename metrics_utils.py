@@ -2,11 +2,13 @@ from typing import List, Dict
 from models import Event, UnscheduledTask, DAY_NAMES
 
 WORK_CATEGORIES = {"Work", "Lab", "Writing", "Admin"}
-PERSONAL_CATEGORIES = {"Health", "Home", "Learning", "Social", "Optional"}
+PERSONAL_CATEGORIES = {"Health", "Home", "Routine", "Learning", "Social", "Optional"}
 RELATIONSHIP_CATEGORIES = {"Relationship"}
+
 
 def event_duration_h(event: Event) -> float:
     return max(event.end_min - event.start_min, 0) / 60
+
 
 def merge_intervals(intervals):
     if not intervals:
@@ -20,6 +22,7 @@ def merge_intervals(intervals):
             merged.append([start, end])
     return merged
 
+
 def occupied_hours(events: List[Event]) -> float:
     by_day = {d: [] for d in range(7)}
     for e in events:
@@ -32,12 +35,14 @@ def occupied_hours(events: List[Event]) -> float:
             total += max(end - start, 0)
     return total / 60
 
+
 def category_hours(events: List[Event]) -> Dict[str, float]:
     out = {}
     for e in events:
         cat = e.category or "Other"
         out[cat] = out.get(cat, 0.0) + event_duration_h(e)
     return out
+
 
 def workload_summary(events: List[Event], unscheduled: List[UnscheduledTask]) -> Dict[str, float]:
     counted = [e for e in events if e.source_task != "Focus Guard"]
@@ -58,6 +63,7 @@ def workload_summary(events: List[Event], unscheduled: List[UnscheduledTask]) ->
         "unscheduled_count": len(unscheduled),
         "unscheduled_high_count": sum(1 for u in unscheduled if u.priority in ["Critical", "High"]),
     }
+
 
 def by_day_dataframe(events: List[Event]):
     import pandas as pd

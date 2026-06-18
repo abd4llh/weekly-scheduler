@@ -48,9 +48,8 @@ class TimeWindow:
             raise ValueError("weekday must be between 0 and 6.")
         if self.weight < 0 or self.outside_penalty < 0:
             raise ValueError("Time-window penalty weights must be non-negative.")
-        if self.preferred_start_min is not None:
-            if not self.start_min <= self.preferred_start_min < self.end_min:
-                raise ValueError("preferred_start_min must be inside the time window.")
+        if self.preferred_start_min is not None and not self.start_min <= self.preferred_start_min < self.end_min:
+            raise ValueError("preferred_start_min must be inside the time window.")
 
 
 @dataclass(frozen=True)
@@ -94,6 +93,7 @@ class PlanningTask:
     sessions_required: Optional[int] = None
     distinct_session_days: bool = False
     prefer_distinct_session_days: bool = False
+    prefer_same_day_sessions: bool = False
     splittable: bool = True
     energy: str = "medium"
     location: str = "any"
@@ -122,11 +122,14 @@ class PlanningTask:
             raise ValueError("distinct_session_days requires sessions_required.")
         if self.prefer_distinct_session_days and self.sessions_required is None:
             raise ValueError("prefer_distinct_session_days requires sessions_required.")
+        if self.prefer_same_day_sessions and self.sessions_required is None:
+            raise ValueError("prefer_same_day_sessions requires sessions_required.")
+        if self.distinct_session_days and self.prefer_same_day_sessions:
+            raise ValueError("A task cannot require distinct days and prefer the same day.")
         if any(day not in range(7) for day in self.required_weekdays):
             raise ValueError("required_weekdays values must be between 0 and 6.")
-        if self.hard_earliest_min_of_day is not None:
-            if not 0 <= self.hard_earliest_min_of_day < 24 * 60:
-                raise ValueError("hard_earliest_min_of_day must be between 0 and 1439.")
+        if self.hard_earliest_min_of_day is not None and not 0 <= self.hard_earliest_min_of_day < 24 * 60:
+            raise ValueError("hard_earliest_min_of_day must be between 0 and 1439.")
         if (self.fixed_start is None) != (self.fixed_end is None):
             raise ValueError("fixed_start and fixed_end must be supplied together.")
         if self.fixed_start and self.fixed_end:

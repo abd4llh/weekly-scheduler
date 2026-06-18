@@ -292,10 +292,7 @@ class WeeklyOptimizer:
             )
 
         generated_events.sort(key=lambda event: (event.start, event.end, event.task_id))
-        daily_load_minutes = [
-            solver.Value(load) * slot_minutes
-            for load in daily_load_vars
-        ]
+        daily_load_minutes = [solver.Value(load) * slot_minutes for load in daily_load_vars]
         return OptimizationResult(
             status=status,
             events=tuple(generated_events),
@@ -359,10 +356,7 @@ class WeeklyOptimizer:
                 model.Add(left.day == right.day).OnlyEnforceIf(same_day)
                 model.Add(left.day != right.day).OnlyEnforceIf(same_day.Not())
 
-                if (
-                    left.task.id == right.task.id
-                    and left.task.prefer_distinct_session_days
-                ):
+                if left.task.id == right.task.id and left.task.prefer_distinct_session_days:
                     objective_terms.append(self.config.weights.same_day_sessions * same_day)
 
                 left_before = model.NewBoolVar(
@@ -390,11 +384,7 @@ class WeeklyOptimizer:
     ) -> None:
         groups: Dict[str, List[PlanningTask]] = {}
         for task in tasks:
-            if (
-                task.sequence_group
-                and task.daily_sequence_rank is not None
-                and task_sessions_by_id.get(task.id)
-            ):
+            if task.sequence_group and task.daily_sequence_rank is not None and task_sessions_by_id.get(task.id):
                 groups.setdefault(task.sequence_group, []).append(task)
 
         compact_slots = self._minutes_to_slots(request.compact_gap_min, request.slot_minutes)
@@ -420,17 +410,13 @@ class WeeklyOptimizer:
                                     model.Add(both >= earlier_flag + later_flag - 1)
 
                                     gap = model.NewIntVar(0, horizon_slots, f"gap_{both.Name()}")
-                                    model.Add(
-                                        gap == later_session.start - earlier_session.end
-                                    ).OnlyEnforceIf(both)
+                                    model.Add(gap == later_session.start - earlier_session.end).OnlyEnforceIf(both)
                                     model.Add(gap == 0).OnlyEnforceIf(both.Not())
                                     objective_terms.append(self.config.weights.compact_gap * gap)
 
                                     excess = model.NewIntVar(0, horizon_slots, f"excess_{both.Name()}")
                                     model.Add(excess >= gap - compact_slots)
-                                    objective_terms.append(
-                                        self.config.weights.compact_gap_excess * excess
-                                    )
+                                    objective_terms.append(self.config.weights.compact_gap_excess * excess)
 
     def _add_daily_workload_objective(
         self,
@@ -441,18 +427,23 @@ class WeeklyOptimizer:
         objective_terms: List[cp_model.LinearExpr],
     ) -> List[cp_model.IntVar]:
         productive = [session for session in sessions if session.task.counts_toward_daily_limit]
-        max_possible = max(1, sum(session.duration_slots for session in productive))
+        if not productive:
+            loads = []
+            for day in range(horizon_days):
+                load = model.NewIntVar(0, 0, f"daily_flexible_load_{day}")
+                model.Add(load == 0)
+                loads.append(load)
+            return loads
+
+        max_possible = sum(session.duration_slots for session in productive)
         hard_max_slots = max(1, request.max_daily_flexible_min // request.slot_minutes)
         target_slots = max(0, request.preferred_daily_flexible_min // request.slot_minutes)
         daily_load_vars: List[cp_model.IntVar] = []
 
         for day in range(horizon_days):
             load = model.NewIntVar(0, max_possible, f"daily_flexible_load_{day}")
-            terms = [
-                session.duration_slots * session.day_flags[day]
-                for session in productive
-            ]
-            model.Add(load == sum(terms) if terms else 0)
+            terms = [session.duration_slots * session.day_flags[day] for session in productive]
+            model.Add(load == sum(terms))
             model.Add(load <= hard_max_slots)
             daily_load_vars.append(load)
 
@@ -475,9 +466,7 @@ class WeeklyOptimizer:
 
     def _decompose_task(self, task: PlanningTask, slot_minutes: int) -> List[int]:
         if task.total_duration_min % slot_minutes != 0:
-            raise ValueError(
-                f"Task '{task.id}' duration must be divisible by slot_minutes ({slot_minutes})."
-            )
+            raise ValueError(f"Task '{task.id}' duration must be divisible by slot_minutes ({slot_minutes}).")
         total_slots = task.total_duration_min // slot_minutes
         min_slots = max(1, math.ceil(task.min_block_min / slot_minutes))
         max_slots = max(min_slots, task.max_block_min // slot_minutes)
@@ -491,9 +480,7 @@ class WeeklyOptimizer:
             minimum_sessions = max(1, math.ceil(total_slots / max_slots))
             maximum_sessions = max(1, total_slots // min_slots)
             if minimum_sessions > maximum_sessions:
-                raise ValueError(
-                    f"Task '{task.id}' cannot be split within its min/max block constraints."
-                )
+                raise ValueError(f"Task '{task.id}' cannot be split within its min/max block constraints.")
             session_count = minimum_sessions
 
         if session_count > total_slots:
@@ -501,9 +488,7 @@ class WeeklyOptimizer:
         base, remainder = divmod(total_slots, session_count)
         sizes = [base + (1 if index < remainder else 0) for index in range(session_count)]
         if any(size < min_slots or size > max_slots for size in sizes):
-            raise ValueError(
-                f"Task '{task.id}' session count conflicts with its min/max block constraints."
-            )
+            raise ValueError(f"Task '{task.id}' session count conflicts with its min/max block constraints.")
         return sizes
 
     def _allowed_start_slots(
@@ -533,10 +518,7 @@ class WeeklyOptimizer:
                 continue
             if minute_of_day + duration_min > request.sleep_min:
                 continue
-            if any(
-                max(start_slot, busy_start) < min(end_slot, busy_end)
-                for busy_start, busy_end in fixed_busy_ranges
-            ):
+            if any(max(start_slot, busy_start) < min(end_slot, busy_end) for busy_start, busy_end in fixed_busy_ranges):
                 continue
             allowed.append(start_slot)
         return allowed
@@ -556,22 +538,12 @@ class WeeklyOptimizer:
             start_dt = self._slot_to_datetime(request, slot)
             start_min = start_dt.hour * 60 + start_dt.minute
             end_min = start_min + duration_min
-            applicable = [
-                window
-                for window in task.preferred_windows
-                if window.weekday is None or window.weekday == start_dt.weekday()
-            ]
+            applicable = [window for window in task.preferred_windows if window.weekday is None or window.weekday == start_dt.weekday()]
             if not applicable:
                 table.append(24 * 60 // request.slot_minutes)
                 continue
             penalties = [
-                self._window_penalty_slots(
-                    start_min,
-                    end_min,
-                    duration_min,
-                    window,
-                    request.slot_minutes,
-                )
+                self._window_penalty_slots(start_min, end_min, duration_min, window, request.slot_minutes)
                 for window in applicable
             ]
             table.append(min(penalties))
@@ -606,23 +578,10 @@ class WeeklyOptimizer:
             distance = max(window.start_min - start_min, end_min - window.end_min, 0)
             direction_multiplier = 3 if window.prefer_later_fallback and start_min < window.start_min else 1
 
-        return (
-            window.outside_penalty
-            + math.ceil(distance / slot_minutes)
-            * max(1, window.weight)
-            * direction_multiplier
-        )
+        return window.outside_penalty + math.ceil(distance / slot_minutes) * max(1, window.weight) * direction_multiplier
 
-    def _transition_slots(
-        self,
-        source: PlanningTask,
-        destination: PlanningTask,
-        request: PlanRequest,
-    ) -> int:
-        minutes = max(
-            source.transition_after_min,
-            self._travel_minutes(source.location, destination.location, request),
-        )
+    def _transition_slots(self, source: PlanningTask, destination: PlanningTask, request: PlanRequest) -> int:
+        minutes = max(source.transition_after_min, self._travel_minutes(source.location, destination.location, request))
         return self._minutes_to_slots(minutes, request.slot_minutes)
 
     @staticmethod
@@ -639,10 +598,7 @@ class WeeklyOptimizer:
         return int(request.default_travel_min)
 
     def _weekend_table(self, request: PlanRequest, horizon_slots: int) -> List[int]:
-        return [
-            1 if self._slot_to_datetime(request, slot).weekday() >= 5 else 0
-            for slot in range(horizon_slots)
-        ]
+        return [1 if self._slot_to_datetime(request, slot).weekday() >= 5 else 0 for slot in range(horizon_slots)]
 
     def _late_start_table(self, request: PlanRequest, horizon_slots: int) -> List[int]:
         table = []
@@ -653,10 +609,7 @@ class WeeklyOptimizer:
         return table
 
     def _day_table(self, request: PlanRequest, horizon_slots: int) -> List[int]:
-        return [
-            max(0, self._day_offset(request.horizon_start, self._slot_to_datetime(request, slot)))
-            for slot in range(horizon_slots)
-        ]
+        return [max(0, self._day_offset(request.horizon_start, self._slot_to_datetime(request, slot))) for slot in range(horizon_slots)]
 
     def _fixed_task_slots(self, task: PlanningTask, request: PlanRequest) -> Tuple[int, int]:
         assert task.fixed_start is not None and task.fixed_end is not None
@@ -670,22 +623,13 @@ class WeeklyOptimizer:
             raise ValueError(f"Fixed task '{task.id}' end must align with slot_minutes.")
         return start_slot, end_slot
 
-    def _clip_to_horizon(
-        self,
-        start: datetime,
-        end: datetime,
-        request: PlanRequest,
-    ) -> Tuple[int, int] | None:
+    def _clip_to_horizon(self, start: datetime, end: datetime, request: PlanRequest) -> Tuple[int, int] | None:
         clipped_start = max(start, request.horizon_start)
         clipped_end = min(end, request.horizon_end)
         if clipped_end <= clipped_start:
             return None
-        start_slot = math.floor(
-            (clipped_start - request.horizon_start).total_seconds() / 60 / request.slot_minutes
-        )
-        end_slot = math.ceil(
-            (clipped_end - request.horizon_start).total_seconds() / 60 / request.slot_minutes
-        )
+        start_slot = math.floor((clipped_start - request.horizon_start).total_seconds() / 60 / request.slot_minutes)
+        end_slot = math.ceil((clipped_end - request.horizon_start).total_seconds() / 60 / request.slot_minutes)
         return start_slot, end_slot
 
     @staticmethod
@@ -707,16 +651,11 @@ class WeeklyOptimizer:
         return "".join(character if character.isalnum() else "_" for character in value)
 
     @staticmethod
-    def _validate_dependencies(
-        tasks: Iterable[PlanningTask],
-        task_by_id: Dict[str, PlanningTask],
-    ) -> None:
+    def _validate_dependencies(tasks: Iterable[PlanningTask], task_by_id: Dict[str, PlanningTask]) -> None:
         for task in tasks:
             for dependency in task.dependencies:
                 if dependency not in task_by_id:
-                    raise ValueError(
-                        f"Task '{task.id}' depends on unknown or inactive task '{dependency}'."
-                    )
+                    raise ValueError(f"Task '{task.id}' depends on unknown or inactive task '{dependency}'.")
                 if dependency == task.id:
                     raise ValueError(f"Task '{task.id}' cannot depend on itself.")
 

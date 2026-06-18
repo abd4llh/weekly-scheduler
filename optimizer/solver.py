@@ -112,6 +112,12 @@ class WeeklyOptimizer:
                 continue
 
             block_sizes = self._decompose_task(task, slot_minutes)
+            if task.distinct_session_days and len(block_sizes) > horizon_days:
+                return self._infeasible_result(
+                    active_tasks,
+                    f"Task '{task.title}' requires more distinct session days than the horizon contains.",
+                )
+
             task_sessions: List[_SessionVariable] = []
             for index, duration_slots in enumerate(block_sizes):
                 allowed_starts = self._allowed_start_slots(
@@ -185,6 +191,9 @@ class WeeklyOptimizer:
 
             for previous, current in zip(task_sessions, task_sessions[1:]):
                 model.Add(previous.end <= current.start)
+
+            if task.distinct_session_days and len(task_sessions) > 1:
+                model.AddAllDifferent([session.day for session in task_sessions])
 
             if len(task_sessions) == 1:
                 task_start_vars[task.id] = task_sessions[0].start

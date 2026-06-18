@@ -6,9 +6,9 @@ DAY_TO_INDEX = {d.lower(): i for i, d in enumerate(DAY_NAMES)} | {d.lower(): i f
 
 PRIORITY_SCORE = {"Critical": 4, "High": 3, "Medium": 2, "Low": 1, "Optional": 0}
 ENERGY_SCORE = {"High": 3, "Medium": 2, "Physical": 2, "Creative": 2, "Low": 1}
-CATEGORIES = ["Work", "Lab", "Writing", "Admin", "Health", "Home", "Relationship", "Social", "Learning", "Optional", "Focus", "Other"]
+CATEGORIES = ["Work", "Lab", "Writing", "Admin", "Health", "Home", "Routine", "Relationship", "Social", "Learning", "Optional", "Focus", "Other"]
 PLANNING_MODES = ["Balanced week", "Work-heavy week", "Recovery week", "Deadline mode", "Social weekend mode"]
-APP_VERSION = "Weekly Scheduler v0.10.3 — final duration correction"
+APP_VERSION = "Weekly Scheduler v0.11.0 — daily rhythm"
 
 @dataclass
 class Task:

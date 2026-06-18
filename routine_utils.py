@@ -1,6 +1,6 @@
 from typing import Dict, List, Tuple
 
-from models import Event, Task
+from models import DAY_NAMES, Event, Task, UnscheduledTask
 from parser_utils import hhmm_to_minutes, minutes_to_hhmm
 
 ROUTINE_CATEGORY = "Routine"
@@ -20,11 +20,7 @@ def _clamp_window(start_min: int, end_min: int, wake_min: int, sleep_min: int):
 
 
 def routine_requirements_from_settings(settings: Dict) -> List[Dict]:
-    """Build flexible daily routine requirements from sidebar settings.
-
-    These are windows, not fixed calendar anchors. The AI chooses the exact time
-    each day around fixed meetings and the logical flow of the day.
-    """
+    """Build flexible daily routine requirements from sidebar settings."""
     wake_min = int(settings.get("wake_min", 360))
     sleep_min = int(settings.get("sleep_min", 1380))
     requirements = []
@@ -148,7 +144,7 @@ def routine_requirements_payload(settings: Dict) -> List[Dict]:
     return [
         {
             "title": item["title"],
-            "days": ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"],
+            "days": DAY_NAMES,
             "duration_min": item["duration_min"],
             "window_start": item["window_start"],
             "window_end": item["window_end"],
@@ -195,27 +191,152 @@ def normalize_routine_tasks(tasks: List[Task], settings: Dict) -> List[Task]:
     return clean
 
 
+def _matches_routine(event: Event, title: str, day: int = None) -> bool:
+    if day is not None and event.day_index != day:
+        return False
+    return (
+        event.source_task.strip().lower() == title.lower()
+        or event.title.strip().lower() == title.lower()
+    )
+
+
+def _slot_is_free(day: int, start: int, end: int, events: List[Event]) -> bool:
+    for event in events:
+        if event.day_index != day:
+            continue
+        if max(start, event.start_min) < min(end, event.end_min):
+            return False
+    return True
+
+
+def _blocking_event_titles(day: int, start: int, end: int, events: List[Event]) -> List[str]:
+    titles = []
+    for event in events:
+        if event.day_index != day:
+            continue
+        if max(start, event.start_min) < min(end, event.end_min):
+            if event.title not in titles:
+                titles.append(event.title)
+    return titles
+
+
+def repair_routine_windows(
+    tasks: List[Task],
+    events: List[Event],
+    unscheduled: List[UnscheduledTask],
+    settings: Dict,
+) -> Tuple[List[Task], List[Event], List[UnscheduledTask]]:
+    """Move enabled routines into their allowed windows or mark them unscheduled.
+
+    An out-of-window meal is never silently kept. If no valid slot exists inside
+    the configured window, the routine is removed from the calendar and listed
+    as unscheduled for that specific day.
+    """
+    tasks = normalize_routine_tasks(list(tasks), settings)
+    events = list(events)
+    requirements = routine_requirements_from_settings(settings)
+    routine_titles = {item["title"] for item in requirements}
+
+    unscheduled = [
+        item for item in unscheduled
+        if not any(
+            item.title == title or item.title.startswith(f"{title} (")
+            for title in routine_titles
+        )
+    ]
+
+    for requirement in requirements:
+        title = requirement["title"]
+        duration = int(requirement["duration_min"])
+        window_start = int(requirement["window_start_min"])
+        window_end = int(requirement["window_end_min"])
+        preferred = int(requirement["preferred_start_min"])
+
+        for day in range(7):
+            matches = [event for event in events if _matches_routine(event, title, day)]
+            other_events = [event for event in events if event not in matches]
+
+            valid_matches = [
+                event for event in matches
+                if event.end_min - event.start_min == duration
+                and event.start_min >= window_start
+                and event.end_min <= window_end
+                and _slot_is_free(day, event.start_min, event.end_min, other_events)
+            ]
+
+            if valid_matches:
+                keep = min(valid_matches, key=lambda event: abs(event.start_min - preferred))
+                events = [event for event in events if event not in matches or event is keep]
+                continue
+
+            events = [event for event in events if event not in matches]
+            latest_start = window_end - duration
+            candidate_starts = list(range(window_start, latest_start + 1, 15)) if latest_start >= window_start else []
+            candidate_starts.sort(key=lambda start: (abs(start - preferred), start))
+
+            chosen = None
+            for start in candidate_starts:
+                if _slot_is_free(day, start, start + duration, events):
+                    chosen = start
+                    break
+
+            if chosen is not None:
+                events.append(Event(
+                    title=title,
+                    day_index=day,
+                    start_min=chosen,
+                    end_min=chosen + duration,
+                    priority=requirement["priority"],
+                    source_task=title,
+                    notes=requirement["notes"],
+                    explanation=(
+                        f"Moved into the allowed {requirement['window_start']}–{requirement['window_end']} "
+                        "window while preserving fixed and higher-priority events."
+                    ),
+                    category=ROUTINE_CATEGORY,
+                ))
+                continue
+
+            blockers = _blocking_event_titles(day, window_start, window_end, events)
+            blocker_text = ", ".join(blockers) if blockers else "the existing schedule"
+            unscheduled.append(UnscheduledTask(
+                title=f"{title} ({DAY_NAMES[day]})",
+                reason=(
+                    f"No {duration}-minute slot exists inside {requirement['window_start']}–"
+                    f"{requirement['window_end']} because it conflicts with {blocker_text}."
+                ),
+                task_type="Recurring",
+                priority=requirement["priority"],
+                duration_min=duration,
+                notes=requirement["notes"],
+                category=ROUTINE_CATEGORY,
+            ))
+
+        routine_task = next((task for task in tasks if task.title == title), None)
+        if routine_task:
+            routine_task.sessions_per_week = len([
+                event for event in events if _matches_routine(event, title)
+            ])
+
+    events.sort(key=lambda event: (event.day_index, event.start_min, event.end_min, event.title))
+    return tasks, events, unscheduled
+
+
 def validate_routine_requirements(events, settings: Dict) -> List[Dict]:
     issues = []
     requirements = routine_requirements_from_settings(settings)
-    day_names = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
 
     for requirement in requirements:
         title = requirement["title"]
         for day in range(7):
-            matches = [
-                event for event in events
-                if event.day_index == day
-                and (
-                    event.source_task.strip().lower() == title.lower()
-                    or event.title.strip().lower() == title.lower()
-                )
-            ]
-            if len(matches) != 1:
+            matches = [event for event in events if _matches_routine(event, title, day)]
+            if len(matches) == 0:
+                continue
+            if len(matches) > 1:
                 issues.append({
                     "level": "error",
                     "task": title,
-                    "message": f"{title} must appear exactly once on {day_names[day]}; found {len(matches)}.",
+                    "message": f"{title} appears more than once on {DAY_NAMES[day]}.",
                 })
                 continue
 
@@ -246,11 +367,7 @@ def validate_routine_requirements(events, settings: Dict) -> List[Dict]:
 
 
 def place_routines_flexibly(tasks: List[Task], events: List[Event], settings: Dict) -> Tuple[List[Task], List[Event]]:
-    """Fallback routine placement inside windows after all higher-priority events.
-
-    The AI planner is the primary decision-maker. This helper is used only when
-    the AI planning call fails and the deterministic scheduler is used instead.
-    """
+    """Fallback routine placement inside windows after all higher-priority events."""
     tasks = normalize_routine_tasks(tasks, settings)
     events = [event for event in events if event.category != ROUTINE_CATEGORY]
 
@@ -283,7 +400,7 @@ def place_routines_flexibly(tasks: List[Task], events: List[Event], settings: Di
                 notes=requirement["notes"],
                 explanation=(
                     f"Placed inside the flexible {requirement['window_start']}–{requirement['window_end']} "
-                    f"window while avoiding fixed and higher-priority events."
+                    "window while avoiding fixed and higher-priority events."
                 ),
                 category=ROUTINE_CATEGORY,
             ))

@@ -15,6 +15,9 @@ from .solver import WeeklyOptimizer
 DEFAULT_SLOT_MINUTES = 5
 DEFAULT_DAILY_TARGET_MIN = 8 * 60
 DEFAULT_DAILY_MAX_MIN = 10 * 60
+DEFAULT_TOTAL_BURDEN_TARGET_MIN = 10 * 60
+DEFAULT_FOCUSED_WORK_TARGET_MIN = 4 * 60
+DEFAULT_LATE_FOCUS_START_MIN = 19 * 60
 DEFAULT_TRAVEL_MIN = 20
 DEFAULT_COMPACT_GAP_MIN = 30
 
@@ -35,16 +38,19 @@ def _optimizer_event_to_legacy(event, week_start: datetime, task: Task) -> Event
     end_min = event.end.hour * 60 + event.end.minute
 
     if event.source.value == "fixed_task":
-        explanation = "Fixed event preserved exactly by the optimization engine."
+        explanation = (
+            "Fixed event preserved exactly; surrounding tasks include the required transition "
+            "or travel time."
+        )
     elif task.category == ROUTINE_CATEGORY:
         explanation = (
-            "Placed by the optimization engine using the routine's preferred time, "
-            "daily sequence, and compact-gap rules while preserving fixed commitments."
+            "Placed using the routine's preferred time and daily sequence. Meal earliest times "
+            "are protected, while blocked meals may move later."
         )
     else:
         explanation = (
-            "Placed by the OR-Tools optimization engine to satisfy hard constraints while "
-            "balancing workload, spreading sessions, and reserving transition or travel time."
+            "Placed by OR-Tools while balancing flexible work, total daily burden, focused work, "
+            "session distribution, and transition or travel time."
         )
 
     return Event(
@@ -65,7 +71,7 @@ def optimize_legacy_week(
     week_start: date | datetime,
     settings: Dict,
 ) -> Tuple[List[Task], List[Event], List[UnscheduledTask], List[Dict], Dict]:
-    """Run the v0.12 optimizer and convert its result back to the current UI model."""
+    """Run the optimizer and convert its result back to the current UI model."""
 
     normalized_tasks = normalize_routine_tasks(list(tasks), settings)
     start_dt = _week_start_datetime(week_start)
@@ -83,6 +89,15 @@ def optimize_legacy_week(
         max_daily_flexible_min=int(
             settings.get("max_daily_flexible_min", DEFAULT_DAILY_MAX_MIN)
         ),
+        preferred_daily_total_min=int(
+            settings.get("preferred_daily_total_min", DEFAULT_TOTAL_BURDEN_TARGET_MIN)
+        ),
+        preferred_daily_focus_min=int(
+            settings.get("preferred_daily_focus_min", DEFAULT_FOCUSED_WORK_TARGET_MIN)
+        ),
+        late_focus_start_min=int(
+            settings.get("late_focus_start_min", DEFAULT_LATE_FOCUS_START_MIN)
+        ),
         default_travel_min=int(settings.get("default_travel_min", DEFAULT_TRAVEL_MIN)),
         compact_gap_min=int(settings.get("compact_gap_min", DEFAULT_COMPACT_GAP_MIN)),
         timezone=str(settings.get("timezone", "Europe/Berlin")),
@@ -91,7 +106,7 @@ def optimize_legacy_week(
 
     optimizer = WeeklyOptimizer(
         OptimizerConfig(
-            max_solve_seconds=20.0,
+            max_solve_seconds=25.0,
             num_search_workers=8,
             random_seed=7,
             log_search_progress=False,
@@ -153,8 +168,13 @@ def optimize_legacy_week(
         "num_conflicts": result.diagnostics.get("num_conflicts"),
         "num_branches": result.diagnostics.get("num_branches"),
         "daily_flexible_load_minutes": result.diagnostics.get("daily_flexible_load_minutes", []),
+        "daily_total_burden_minutes": result.diagnostics.get("daily_total_burden_minutes", []),
+        "daily_focused_work_minutes": result.diagnostics.get("daily_focused_work_minutes", []),
         "preferred_daily_flexible_min": request.preferred_daily_flexible_min,
         "max_daily_flexible_min": request.max_daily_flexible_min,
+        "preferred_daily_total_min": request.preferred_daily_total_min,
+        "preferred_daily_focus_min": request.preferred_daily_focus_min,
+        "late_focus_start_min": request.late_focus_start_min,
         "default_travel_min": request.default_travel_min,
         "compact_gap_min": request.compact_gap_min,
     }

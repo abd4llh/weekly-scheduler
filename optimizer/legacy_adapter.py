@@ -74,6 +74,7 @@ def _routine_windows(settings: Dict | None) -> Dict[str, Tuple[TimeWindow, ...]]
                 int(requirement["window_end_min"]),
                 weekday=day,
                 weight=4,
+                prefer_later_fallback=True,
             )
             for day in range(7)
         )

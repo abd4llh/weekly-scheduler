@@ -13,6 +13,10 @@ from .solver import WeeklyOptimizer
 
 
 DEFAULT_SLOT_MINUTES = 5
+DEFAULT_DAILY_TARGET_MIN = 8 * 60
+DEFAULT_DAILY_MAX_MIN = 10 * 60
+DEFAULT_TRAVEL_MIN = 20
+DEFAULT_COMPACT_GAP_MIN = 30
 
 
 def _week_start_datetime(value: date | datetime) -> datetime:
@@ -34,13 +38,13 @@ def _optimizer_event_to_legacy(event, week_start: datetime, task: Task) -> Event
         explanation = "Fixed event preserved exactly by the optimization engine."
     elif task.category == ROUTINE_CATEGORY:
         explanation = (
-            "Placed by the optimization engine. The configured routine window is a preference, "
-            "so fixed and higher-priority commitments may move it to the nearest practical time."
+            "Placed by the optimization engine using the routine's preferred time, "
+            "daily sequence, and compact-gap rules while preserving fixed commitments."
         )
     else:
         explanation = (
             "Placed by the OR-Tools optimization engine to satisfy hard constraints while "
-            "minimizing timing, weekend, and workload-balance penalties."
+            "balancing workload, spreading sessions, and reserving transition or travel time."
         )
 
     return Event(
@@ -73,6 +77,14 @@ def optimize_legacy_week(
         slot_minutes=DEFAULT_SLOT_MINUTES,
         protect_weekend=bool(settings.get("protect_weekend", False)),
         transition_min=int(settings.get("transition_min", 0)),
+        preferred_daily_flexible_min=int(
+            settings.get("preferred_daily_flexible_min", DEFAULT_DAILY_TARGET_MIN)
+        ),
+        max_daily_flexible_min=int(
+            settings.get("max_daily_flexible_min", DEFAULT_DAILY_MAX_MIN)
+        ),
+        default_travel_min=int(settings.get("default_travel_min", DEFAULT_TRAVEL_MIN)),
+        compact_gap_min=int(settings.get("compact_gap_min", DEFAULT_COMPACT_GAP_MIN)),
         timezone=str(settings.get("timezone", "Europe/Berlin")),
         routine_settings=settings,
     )
@@ -140,5 +152,10 @@ def optimize_legacy_week(
         "session_count": result.diagnostics.get("session_count", len(result.events)),
         "num_conflicts": result.diagnostics.get("num_conflicts"),
         "num_branches": result.diagnostics.get("num_branches"),
+        "daily_flexible_load_minutes": result.diagnostics.get("daily_flexible_load_minutes", []),
+        "preferred_daily_flexible_min": request.preferred_daily_flexible_min,
+        "max_daily_flexible_min": request.max_daily_flexible_min,
+        "default_travel_min": request.default_travel_min,
+        "compact_gap_min": request.compact_gap_min,
     }
     return normalized_tasks, events, unscheduled, issues, metadata

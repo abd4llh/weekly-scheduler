@@ -9,6 +9,27 @@ PRIORITIES = ["Critical", "High", "Medium", "Low", "Optional"]
 TASK_TYPES = ["Fixed", "Flexible", "Recurring", "Multi-session"]
 PREFERRED_TIMES = ["Morning", "Workday", "Afternoon", "Evening", "Weekend", "Any"]
 ENERGIES = ["High", "Medium", "Low", "Physical", "Creative"]
+NUMBER_WORDS = {
+    "one": 1,
+    "two": 2,
+    "three": 3,
+    "four": 4,
+    "five": 5,
+    "six": 6,
+    "seven": 7,
+    "eight": 8,
+    "nine": 9,
+    "ten": 10,
+    "eleven": 11,
+    "twelve": 12,
+    "thirteen": 13,
+    "fourteen": 14,
+}
+TIME_QUANTITY_NOUNS = {
+    "minute", "minutes", "hour", "hours", "day", "days", "week", "weeks",
+    "month", "months", "year", "years",
+}
+DAY_PATTERN = "|".join(day.lower() for day in DAY_NAMES)
 
 SYSTEM_PROMPT = """
 You extract structured tasks for a general-purpose weekly scheduler. Input may be paragraphs, bullets, grammar mistakes, mixed languages, or specialist terminology. Extract every actionable task and return only JSON.
@@ -27,11 +48,15 @@ Allowed values:
 
 Rules:
 - Fixed requires an exact day and clock time. A daypart is not an exact time.
-- Recurring duration is per occurrence. Multi-session duration is the weekly total.
-- Preserve explicit session or item counts, but a quantity alone does not imply separate days.
+- Recurring duration is per occurrence. Multi-session duration is the total across all sessions.
+- Every explicit count of repeated occurrences, trips, calls, appointments, sessions, or deliverable units must be preserved in sessions_per_week.
+- Example: "two trips" means sessions_per_week=2. If no duration is given, estimate duration per trip and use Recurring.
+- Example: "prepare three sections in six hours total" means Multi-session, sessions_per_week=3, duration_min=360 total.
+- A quantity does not automatically require different days. Use the session_distribution field independently.
 - Use required_day for a day without an exact time, earliest_day for a true not-before rule, and deadline fields only for real deadlines.
+- "Before Friday" means completion strictly before Friday begins: deadline_day="Friday", deadline_time="00:00". "By Friday" may include Friday unless a time is stated.
 - Morning is about 07:00-12:00, Workday 09:00-17:00, Afternoon 13:00-18:00, Evening 18:00-22:00.
-- depends_on must exactly match another extracted title and should be used only for a genuine prerequisite.
+- depends_on must exactly match another extracted title and should be used when a later action cannot start until the earlier action is complete.
 - location is a concise stable place label such as Home, Office, Campus, Client site, Store, Remote, or Any. Use the same label for the same place. Do not invent a location when unknown.
 - cognitive_load describes concentration and decision effort, independent of profession. physical_load describes physical effort.
 - Require different days only when spacing is explicit or intrinsic. Prefer different days when spacing helps learning, recovery, or progress. Prefer same day when batching saves setup, travel, or context switching. Otherwise use Any.
@@ -41,7 +66,9 @@ Rules:
 - Estimate missing durations conservatively and mark duration_is_estimated true.
 """
 
-REPAIR_PROMPT = "Repair the JSON from validator feedback without adding profession-specific assumptions. Return only the same JSON shape."
+REPAIR_PROMPT = """
+Repair the JSON from validator feedback without adding profession-specific assumptions. Preserve every explicit occurrence or deliverable count in sessions_per_week. Use Recurring with per-occurrence duration for repeated activities and Multi-session with total duration for a divisible workload. Preserve strict-before deadlines as 00:00 at the beginning of the named day. Return only the same JSON shape.
+"""
 
 
 def _pick(value, allowed, default):
@@ -91,6 +118,42 @@ def _to_bool(value, default=False):
     return default
 
 
+def _task_text(task):
+    return " ".join(str(value or "") for value in [task.title, task.notes, task.assumptions]).lower()
+
+
+def _explicit_non_time_quantity(text):
+    number_pattern = r"\d+|" + "|".join(NUMBER_WORDS)
+    pattern = re.compile(
+        rf"\b(?P<count>{number_pattern})\s+(?:(?:[a-z][a-z-]*)\s+){{0,3}}(?P<noun>[a-z][a-z-]*)\b",
+        re.IGNORECASE,
+    )
+    for match in pattern.finditer(str(text or "")):
+        raw = match.group("count").lower()
+        count = int(raw) if raw.isdigit() else NUMBER_WORDS.get(raw)
+        noun = match.group("noun").lower()
+        if count is None or count <= 1 or count > 14:
+            continue
+        if noun in TIME_QUANTITY_NOUNS:
+            continue
+        return count
+    return None
+
+
+def _apply_strict_before_deadline(task):
+    if not task.deadline_day:
+        return task
+    text = _task_text(task)
+    day = task.deadline_day.lower()
+    match = re.search(
+        rf"\bbefore\s+({DAY_PATTERN})\b(?!\s+(?:morning|afternoon|evening|night|noon|midnight|\d{{1,2}}(?::\d{{2}})?))",
+        text,
+    )
+    if match and match.group(1) == day:
+        task.deadline_time = "00:00"
+    return task
+
+
 def _postprocess_task(task):
     if task.task_type == "Fixed" and (not task.fixed_day or not task.fixed_start):
         if task.fixed_day and not task.fixed_start:
@@ -98,17 +161,13 @@ def _postprocess_task(task):
         task.fixed_day = ""
         task.fixed_start = ""
         task.task_type = "Flexible"
-    if task.task_type == "Recurring" and task.sessions_per_week <= 1:
-        task.task_type = "Flexible"
-    if task.task_type not in {"Recurring", "Multi-session"}:
-        task.sessions_per_week = 1
     if task.sessions_per_week <= 1:
         task.session_distribution = "Any"
     task.min_block_min = min(max(1, int(task.min_block_min)), int(task.duration_min))
     task.max_block_min = min(max(int(task.max_block_min), int(task.min_block_min)), int(task.duration_min))
     task.recovery_min = max(0, min(180, int(task.recovery_min)))
     task.location = _clean_location(task.location)
-    return task
+    return _apply_strict_before_deadline(task)
 
 
 def _task_from_dict(item):
@@ -167,6 +226,13 @@ def validate_ai_tasks(tasks):
             issues.append(f"{label}: Fixed task is missing an exact day or time.")
         if task.sessions_per_week > 1 and task.task_type not in {"Recurring", "Multi-session"}:
             issues.append(f"{label}: multiple sessions require Recurring or Multi-session.")
+        if task.task_type == "Recurring" and task.sessions_per_week <= 1:
+            issues.append(f"{label}: Recurring task requires more than one occurrence.")
+        explicit_count = _explicit_non_time_quantity(_task_text(task))
+        if explicit_count and task.sessions_per_week != explicit_count:
+            issues.append(
+                f"{label}: the text contains an explicit count of {explicit_count}, but sessions_per_week is {task.sessions_per_week}. Preserve the count and choose Recurring or Multi-session with the correct duration semantics."
+            )
         if task.min_block_min > task.max_block_min:
             issues.append(f"{label}: minimum block exceeds maximum block.")
         if task.depends_on and task.depends_on not in titles:
@@ -190,7 +256,7 @@ def _call_ai(client, model, messages):
     return json.loads(response.choices[0].message.content)
 
 
-def parse_tasks_with_ai(raw_text, api_key, model="gpt-4.1-mini", repair_passes=1, user_defaults=None):
+def parse_tasks_with_ai(raw_text, api_key, model="gpt-4.1-mini", repair_passes=2, user_defaults=None):
     if not api_key:
         raise ValueError("Missing OpenAI API key.")
     client = OpenAI(api_key=api_key)

@@ -120,6 +120,7 @@ def _routine_windows(settings: Dict | None) -> Dict[str, Tuple[TimeWindow, ...]]
         return {}
     output = {}
     meal_titles = {"Breakfast", "Lunch", "Dinner"}
+    breakfast_target = hhmm_to_minutes(str(settings.get("breakfast_preferred_time", "")))
     for requirement in routine_requirements_from_settings(settings):
         title = requirement["title"]
         duration = int(requirement["duration_min"])
@@ -131,6 +132,17 @@ def _routine_windows(settings: Dict | None) -> Dict[str, Tuple[TimeWindow, ...]]
             int(requirement["preferred_start_min"]),
             duration,
         )
+        if (
+            title == "Morning routine"
+            and settings.get("breakfast_enabled", False)
+            and breakfast_target is not None
+        ):
+            preferred = _clamp_target(
+                start,
+                end,
+                int(breakfast_target) - duration,
+                duration,
+            )
         output[title.strip().lower()] = tuple(
             TimeWindow(
                 start,

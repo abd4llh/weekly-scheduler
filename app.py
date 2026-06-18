@@ -9,6 +9,7 @@ from ai_parser import parse_tasks_with_ai
 from ai_planner import plan_week_with_ai, validate_ai_plan
 from calendar_utils import events_to_ics, next_monday, render_calendar_html
 from category_utils import normalize_task_categories
+from constraint_completion import complete_schedule_constraints
 from metrics_utils import workload_summary
 from models import APP_VERSION, CATEGORIES, DAY_NAMES, PLANNING_MODES, PRIORITY_SCORE, Task
 from parser_utils import minutes_to_hhmm, tasks_from_json, tasks_to_json
@@ -91,32 +92,32 @@ with st.sidebar:
         if lunch_enabled:
             l1, l2, l3 = st.columns(3)
             with l1:
-                lunch_window_start = st.time_input("Lunch earliest", value=time(11, 30))
+                lunch_window_start = st.time_input("Lunch earliest", value=time(11, 0))
             with l2:
                 lunch_preferred_time = st.time_input("Lunch preferred", value=time(13, 0))
             with l3:
-                lunch_window_end = st.time_input("Lunch latest", value=time(15, 0))
+                lunch_window_end = st.time_input("Lunch latest", value=time(14, 0))
             lunch_duration_min = st.selectbox("Lunch duration", [15, 30, 45, 60, 75], index=2)
         else:
-            lunch_window_start = time(11, 30)
+            lunch_window_start = time(11, 0)
             lunch_preferred_time = time(13, 0)
-            lunch_window_end = time(15, 0)
+            lunch_window_end = time(14, 0)
             lunch_duration_min = 45
 
         dinner_enabled = st.checkbox("Add dinner", value=False)
         if dinner_enabled:
             d1, d2, d3 = st.columns(3)
             with d1:
-                dinner_window_start = st.time_input("Dinner earliest", value=time(17, 30))
+                dinner_window_start = st.time_input("Dinner earliest", value=time(18, 0))
             with d2:
                 dinner_preferred_time = st.time_input("Dinner preferred", value=time(19, 0))
             with d3:
-                dinner_window_end = st.time_input("Dinner latest", value=time(21, 30))
+                dinner_window_end = st.time_input("Dinner latest", value=time(21, 0))
             dinner_duration_min = st.selectbox("Dinner duration", [30, 45, 60, 75, 90], index=2)
         else:
-            dinner_window_start = time(17, 30)
+            dinner_window_start = time(18, 0)
             dinner_preferred_time = time(19, 0)
-            dinner_window_end = time(21, 30)
+            dinner_window_end = time(21, 0)
             dinner_duration_min = 60
 
         wind_down_enabled = st.checkbox("Add evening wind-down", value=False)
@@ -242,6 +243,27 @@ def settings_payload():
     }
 
 
+def finalize_and_validate(tasks, events, unscheduled, anchors):
+    settings = settings_payload()
+    tasks, events, unscheduled = complete_schedule_constraints(
+        tasks,
+        events,
+        unscheduled,
+        anchors,
+        settings,
+    )
+    issues = validate_ai_plan(
+        tasks,
+        events,
+        unscheduled,
+        wake_time.hour * 60 + wake_time.minute,
+        sleep_time.hour * 60 + sleep_time.minute,
+        anchors,
+        settings,
+    )
+    return tasks, events, unscheduled, issues
+
+
 def deterministic_fallback(tasks):
     scheduler = Scheduler(
         wake_time.hour * 60 + wake_time.minute,
@@ -251,16 +273,7 @@ def deterministic_fallback(tasks):
     )
     events, unscheduled = scheduler.schedule(tasks, include_focus_guard)
     tasks_with_routines, events = place_routines_flexibly(tasks, events, settings_payload())
-    issues = validate_ai_plan(
-        tasks_with_routines,
-        events,
-        unscheduled,
-        wake_time.hour * 60 + wake_time.minute,
-        sleep_time.hour * 60 + sleep_time.minute,
-        tasks,
-        settings_payload(),
-    )
-    return tasks_with_routines, events, unscheduled, issues
+    return finalize_and_validate(tasks_with_routines, events, unscheduled, tasks)
 
 
 def generate_schedule_from_text(raw_text: str):
@@ -277,12 +290,18 @@ def generate_schedule_from_text(raw_text: str):
         try:
             parsed_tasks, parse_warnings = parse_tasks_with_ai(raw_text, api_key, model=model)
             parsed_tasks = normalize_task_categories(parsed_tasks)
-            tasks, events, unscheduled, issues, planner_warnings = plan_week_with_ai(
+            tasks, events, unscheduled, _, planner_warnings = plan_week_with_ai(
                 raw_text,
                 parsed_tasks,
                 api_key,
                 model,
                 settings_payload(),
+            )
+            tasks, events, unscheduled, issues = finalize_and_validate(
+                tasks,
+                events,
+                unscheduled,
+                parsed_tasks,
             )
             st.session_state.parsed_tasks = normalize_task_categories(tasks)
             st.session_state.events = events
@@ -383,12 +402,18 @@ with tab_tasks:
                         st.error("AI is not configured for this deployment.")
                     else:
                         with st.spinner("Planning from edited tasks..."):
-                            tasks, events, unscheduled, issues, warnings = plan_week_with_ai(
+                            tasks, events, unscheduled, _, warnings = plan_week_with_ai(
                                 st.session_state.raw_task_text,
                                 reviewed_tasks,
                                 api_key,
                                 model,
                                 settings_payload(),
+                            )
+                            tasks, events, unscheduled, issues = finalize_and_validate(
+                                tasks,
+                                events,
+                                unscheduled,
+                                reviewed_tasks,
                             )
                             st.session_state.parsed_tasks = normalize_task_categories(tasks)
                             st.session_state.events = events

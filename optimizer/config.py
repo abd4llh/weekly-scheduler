@@ -10,7 +10,10 @@ class OptimizerWeights:
     late_start: int = 1
     daily_load_imbalance: int = 12
     daily_overload: int = 30
-    same_day_sessions: int = 45
+    total_burden_overload: int = 22
+    focused_work_overload: int = 28
+    late_focused_work: int = 18
+    same_day_sessions: int = 5000
     compact_gap: int = 2
     compact_gap_excess: int = 12
 

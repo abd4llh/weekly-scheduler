@@ -63,21 +63,35 @@ def _preferred_windows(task: LegacyTask, wake_min: int, sleep_min: int) -> Tuple
     return tuple(TimeWindow(bounds[0], bounds[1], weekday=weekday) for weekday in weekdays)
 
 
-def _routine_windows(settings: Dict | None) -> Dict[str, Tuple[TimeWindow, ...]]:
+def _routine_windows(settings: Dict | None, sleep_min: int) -> Dict[str, Tuple[TimeWindow, ...]]:
     if not settings:
         return {}
     output = {}
+    meal_titles = {"Breakfast", "Lunch", "Dinner"}
     for requirement in routine_requirements_from_settings(settings):
-        output[requirement["title"].strip().lower()] = tuple(
-            TimeWindow(
-                int(requirement["window_start_min"]),
-                int(requirement["window_end_min"]),
-                weekday=day,
-                weight=4,
-                prefer_later_fallback=True,
+        title = requirement["title"]
+        windows = []
+        for day in range(7):
+            windows.append(
+                TimeWindow(
+                    int(requirement["window_start_min"]),
+                    int(requirement["window_end_min"]),
+                    weekday=day,
+                    weight=4,
+                    prefer_later_fallback=title in meal_titles,
+                )
             )
-            for day in range(7)
-        )
+            if title in meal_titles and int(requirement["window_end_min"]) < sleep_min:
+                windows.append(
+                    TimeWindow(
+                        int(requirement["window_end_min"]),
+                        sleep_min,
+                        weekday=day,
+                        weight=1,
+                        prefer_later_fallback=True,
+                    )
+                )
+        output[title.strip().lower()] = tuple(windows)
     return output
 
 
@@ -110,7 +124,7 @@ def legacy_tasks_to_plan_request(
         task.title.strip().lower(): task_id
         for task, task_id in zip(tasks, ids)
     }
-    routine_windows = _routine_windows(routine_settings)
+    routine_windows = _routine_windows(routine_settings, sleep_min)
 
     canonical_tasks = []
     for task, task_id in zip(tasks, ids):

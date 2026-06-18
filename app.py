@@ -12,6 +12,7 @@ from category_utils import normalize_task_categories
 from constraint_completion import complete_schedule_constraints
 from metrics_utils import workload_summary
 from models import APP_VERSION, CATEGORIES, DAY_NAMES, PLANNING_MODES, PRIORITY_SCORE, Task
+from optimizer.app_bridge import optimize_legacy_week
 from parser_utils import minutes_to_hhmm, tasks_from_json, tasks_to_json
 from routine_utils import ROUTINE_CATEGORY, place_routines_flexibly, routine_requirements_payload
 from scheduler_engine import Scheduler
@@ -29,7 +30,7 @@ div[data-testid="stMetric"] {border: 1px solid #e5e7eb; border-radius: 14px; pad
 </style>
 <div class="hero">
   <h1>Weekly Scheduler</h1>
-  <p>Paste your week in natural language. AI builds a realistic day around flexible routines, meals, energy, and task order.</p>
+  <p>AI understands the tasks. The experimental optimizer places them using exact constraints and weighted preferences.</p>
 </div>
 """,
     unsafe_allow_html=True,
@@ -44,7 +45,7 @@ def get_secret(name: str, default: str = "") -> str:
 
 
 def reset_schedule():
-    for key in ["events", "unscheduled", "issues"]:
+    for key in ["events", "unscheduled", "issues", "optimizer_info"]:
         st.session_state.pop(key, None)
 
 
@@ -52,9 +53,29 @@ with st.sidebar:
     st.header("Plan settings")
     st.caption(APP_VERSION)
     week_start = st.date_input("Week starts on", value=next_monday(date.today()))
+    planning_engine = st.selectbox(
+        "Planning engine",
+        ["Optimizer preview", "Legacy AI planner"],
+        index=0,
+        help=(
+            "Optimizer preview uses one AI parsing call, then OR-Tools selects exact calendar times. "
+            "Legacy AI planner keeps the previous multi-step planning pipeline for comparison."
+        ),
+    )
     planning_mode = st.selectbox("Planning mode", PLANNING_MODES, index=0)
     protect_weekend = st.checkbox("Protect weekend from heavy work", value=True)
-    include_focus_guard = st.checkbox("Add Focus Guard / transition blocks", value=False)
+    include_focus_guard = st.checkbox(
+        "Add Focus Guard / transition blocks",
+        value=False,
+        disabled=planning_engine == "Optimizer preview",
+        help="Focus Guard remains available only in the legacy engine during this alpha stage.",
+    )
+
+    if planning_engine == "Optimizer preview":
+        st.info(
+            "Alpha engine: exact durations, fixed events, recurrence, dependencies, deadlines, "
+            "preferred windows, weekend protection, and workload balancing are active."
+        )
 
     st.divider()
     wake_time = st.time_input("Wake time", value=time(6, 0))
@@ -149,6 +170,7 @@ for key, value in {
     "events": [],
     "unscheduled": [],
     "issues": [],
+    "optimizer_info": {},
 }.items():
     if key not in st.session_state:
         st.session_state[key] = value
@@ -216,6 +238,7 @@ def settings_payload():
         "wake_time": minutes_to_hhmm(wake_min),
         "sleep_time": minutes_to_hhmm(sleep_min),
         "planning_mode": planning_mode,
+        "planning_engine": planning_engine,
         "protect_weekend": protect_weekend,
         "include_focus_guard": include_focus_guard,
         "week_start": str(week_start),
@@ -241,6 +264,16 @@ def settings_payload():
         "wind_down_min": wind_down_min,
         "transition_min": transition_min,
     }
+
+
+def store_schedule(tasks, events, unscheduled, issues, warnings=None, optimizer_info=None):
+    st.session_state.parsed_tasks = normalize_task_categories(tasks)
+    st.session_state.events = events
+    st.session_state.unscheduled = unscheduled
+    st.session_state.issues = issues
+    st.session_state.ai_warnings = list(warnings or [])
+    st.session_state.optimizer_info = dict(optimizer_info or {})
+    st.session_state.editor_version += 1
 
 
 def finalize_and_validate(tasks, events, unscheduled, anchors):
@@ -286,10 +319,32 @@ def generate_schedule_from_text(raw_text: str):
         st.error("Paste your tasks first.")
         return
 
-    with st.spinner("Generating a realistic weekly schedule..."):
+    spinner_text = (
+        "Parsing tasks, then solving the optimization model..."
+        if planning_engine == "Optimizer preview"
+        else "Generating a realistic weekly schedule..."
+    )
+    with st.spinner(spinner_text):
         try:
             parsed_tasks, parse_warnings = parse_tasks_with_ai(raw_text, api_key, model=model)
             parsed_tasks = normalize_task_categories(parsed_tasks)
+
+            if planning_engine == "Optimizer preview":
+                tasks, events, unscheduled, issues, metadata = optimize_legacy_week(
+                    parsed_tasks,
+                    week_start,
+                    settings_payload(),
+                )
+                store_schedule(
+                    tasks,
+                    events,
+                    unscheduled,
+                    issues,
+                    warnings=parse_warnings,
+                    optimizer_info=metadata,
+                )
+                return
+
             tasks, events, unscheduled, _, planner_warnings = plan_week_with_ai(
                 raw_text,
                 parsed_tasks,
@@ -303,40 +358,97 @@ def generate_schedule_from_text(raw_text: str):
                 unscheduled,
                 parsed_tasks,
             )
-            st.session_state.parsed_tasks = normalize_task_categories(tasks)
-            st.session_state.events = events
-            st.session_state.unscheduled = unscheduled
-            st.session_state.issues = issues
-            st.session_state.ai_warnings = list(parse_warnings) + list(planner_warnings)
-            st.session_state.editor_version += 1
+            store_schedule(
+                tasks,
+                events,
+                unscheduled,
+                issues,
+                warnings=list(parse_warnings) + list(planner_warnings),
+                optimizer_info={"engine": "Legacy AI planner"},
+            )
         except Exception as exc:
+            if planning_engine == "Optimizer preview":
+                store_schedule(
+                    [],
+                    [],
+                    [],
+                    [{
+                        "level": "error",
+                        "task": "Optimizer preview",
+                        "message": str(exc),
+                    }],
+                    warnings=["The optimizer preview could not generate a schedule. The legacy engine remains available for comparison."],
+                    optimizer_info={"engine": "OR-Tools CP-SAT optimizer", "status": "error"},
+                )
+                return
+
             st.warning(f"AI planner failed. Falling back to deterministic scheduling: {exc}")
             parsed_tasks, parse_warnings = parse_tasks_with_ai(raw_text, api_key, model=model)
             parsed_tasks = normalize_task_categories(parsed_tasks)
             tasks, events, unscheduled, issues = deterministic_fallback(parsed_tasks)
-            st.session_state.parsed_tasks = tasks
-            st.session_state.events = events
-            st.session_state.unscheduled = unscheduled
-            st.session_state.issues = issues
-            st.session_state.ai_warnings = parse_warnings
-            st.session_state.editor_version += 1
+            store_schedule(
+                tasks,
+                events,
+                unscheduled,
+                issues,
+                warnings=parse_warnings,
+                optimizer_info={"engine": "Legacy deterministic fallback"},
+            )
+
+
+def regenerate_from_edited_tasks(reviewed_tasks):
+    if planning_engine == "Optimizer preview":
+        tasks, events, unscheduled, issues, metadata = optimize_legacy_week(
+            reviewed_tasks,
+            week_start,
+            settings_payload(),
+        )
+        store_schedule(tasks, events, unscheduled, issues, optimizer_info=metadata)
+        return
+
+    api_key = get_secret("OPENAI_" + "API_KEY", "")
+    model = get_secret("OPENAI_MODEL", "gpt-4.1-mini")
+    if not api_key:
+        raise ValueError("AI is not configured for this deployment.")
+    tasks, events, unscheduled, _, warnings = plan_week_with_ai(
+        st.session_state.raw_task_text,
+        reviewed_tasks,
+        api_key,
+        model,
+        settings_payload(),
+    )
+    tasks, events, unscheduled, issues = finalize_and_validate(
+        tasks,
+        events,
+        unscheduled,
+        reviewed_tasks,
+    )
+    store_schedule(
+        tasks,
+        events,
+        unscheduled,
+        issues,
+        warnings=warnings,
+        optimizer_info={"engine": "Legacy AI planner"},
+    )
 
 
 tab_calendar, tab_tasks, tab_issues, tab_table = st.tabs(["Calendar", "Tasks", "Issues", "Table"])
 
 with tab_tasks:
     st.subheader("Paste your week")
+    st.caption(f"Current engine: {planning_engine}")
     raw = st.text_area(
         "Task list",
         key="raw_task_text",
         height=320,
         label_visibility="collapsed",
-        placeholder="Example: i need finish report 6h, dentist thu 15:00, gym 3 times, cook every day, call family in the evening",
+        placeholder="Example: finish report 6h, dentist Thursday 15:00, gym 3 times, cook every day, call family in the evening",
     )
 
     b1, b2 = st.columns([1.6, 1.1])
     with b1:
-        if st.button("Generate schedule", type="primary", use_container_width=True):
+        if st.button("Generate schedule", type="primary", width="stretch"):
             reset_schedule()
             generate_schedule_from_text(st.session_state.raw_task_text)
             st.rerun()
@@ -347,7 +459,7 @@ with tab_tasks:
                 st.session_state.parsed_tasks = normalize_task_categories(tasks_from_json(uploaded.read().decode("utf-8")))
                 st.session_state.editor_version += 1
                 reset_schedule()
-                st.success("Task JSON loaded. Click Generate schedule to plan it.")
+                st.success("Task JSON loaded. Open advanced review and regenerate from the edited tasks.")
             except Exception as exc:
                 st.error(f"Could not load JSON: {exc}")
 
@@ -357,10 +469,12 @@ with tab_tasks:
             routine_df = pd.DataFrame(active_routines)
             st.dataframe(
                 routine_df[["title", "duration_min", "window_start", "preferred_start", "window_end"]],
-                use_container_width=True,
+                width="stretch",
                 hide_index=True,
             )
-            st.caption("Preferred times are flexible. Fixed and critical events take priority; routines move elsewhere inside their allowed windows.")
+            st.caption(
+                "These are weighted preferences in optimizer mode. Fixed events may move a routine to the nearest practical time."
+            )
 
     if st.session_state.ai_warnings:
         with st.expander("Items to review", expanded=True):
@@ -370,13 +484,13 @@ with tab_tasks:
     if st.session_state.parsed_tasks:
         st.subheader("Detected tasks")
         st.caption("Automatic routine windows are controlled in the sidebar and hidden from this task list.")
-        st.dataframe(simple_task_dataframe(st.session_state.parsed_tasks), use_container_width=True, hide_index=True)
+        st.dataframe(simple_task_dataframe(st.session_state.parsed_tasks), width="stretch", hide_index=True)
 
         with st.expander("Advanced review / edit detected tasks", expanded=False):
             edited = st.data_editor(
                 technical_task_dataframe(st.session_state.parsed_tasks),
                 num_rows="dynamic",
-                use_container_width=True,
+                width="stretch",
                 height=420,
                 key=f"task_editor_{st.session_state.editor_version}",
                 column_config={
@@ -395,40 +509,20 @@ with tab_tasks:
             reviewed_tasks = df_to_tasks(edited)
             c1, c2 = st.columns([1.4, 1.2])
             with c1:
-                if st.button("Regenerate schedule from edited tasks", use_container_width=True):
-                    api_key = get_secret("OPENAI_" + "API_KEY", "")
-                    model = get_secret("OPENAI_MODEL", "gpt-4.1-mini")
-                    if not api_key:
-                        st.error("AI is not configured for this deployment.")
-                    else:
-                        with st.spinner("Planning from edited tasks..."):
-                            tasks, events, unscheduled, _, warnings = plan_week_with_ai(
-                                st.session_state.raw_task_text,
-                                reviewed_tasks,
-                                api_key,
-                                model,
-                                settings_payload(),
-                            )
-                            tasks, events, unscheduled, issues = finalize_and_validate(
-                                tasks,
-                                events,
-                                unscheduled,
-                                reviewed_tasks,
-                            )
-                            st.session_state.parsed_tasks = normalize_task_categories(tasks)
-                            st.session_state.events = events
-                            st.session_state.unscheduled = unscheduled
-                            st.session_state.issues = issues
-                            st.session_state.ai_warnings = warnings
-                            st.session_state.editor_version += 1
+                if st.button("Regenerate schedule from edited tasks", width="stretch"):
+                    try:
+                        with st.spinner("Rebuilding the schedule from edited tasks..."):
+                            regenerate_from_edited_tasks(reviewed_tasks)
                         st.rerun()
+                    except Exception as exc:
+                        st.error(f"Could not regenerate the schedule: {exc}")
             with c2:
                 st.download_button(
                     "Save task JSON",
                     data=tasks_to_json(reviewed_tasks).encode("utf-8"),
                     file_name="weekly_scheduler_tasks.json",
                     mime="application/json",
-                    use_container_width=True,
+                    width="stretch",
                 )
     else:
         st.info("Paste your tasks and click Generate schedule.")
@@ -436,6 +530,7 @@ with tab_tasks:
 events = st.session_state.events
 unscheduled = st.session_state.unscheduled
 issues = st.session_state.issues
+optimizer_info = st.session_state.optimizer_info
 summary = workload_summary(events, unscheduled)
 schedule_df = pd.DataFrame([
     {
@@ -458,13 +553,33 @@ with tab_calendar:
     c3.metric("Personal", f"{summary['personal_hours']:.1f} h")
     c4.metric("Relationship", f"{summary['relationship_hours']:.1f} h")
     c5.metric("Unscheduled", int(summary["unscheduled_count"]))
+
+    if optimizer_info:
+        detail_parts = [f"Engine: {optimizer_info.get('engine', planning_engine)}"]
+        if optimizer_info.get("status"):
+            detail_parts.append(f"status: {optimizer_info['status']}")
+        if optimizer_info.get("solve_seconds") is not None:
+            detail_parts.append(f"solver: {optimizer_info['solve_seconds']:.3f} s")
+        if optimizer_info.get("objective_score") is not None:
+            detail_parts.append(f"objective: {optimizer_info['objective_score']:.1f}")
+        st.caption(" · ".join(detail_parts))
+
     if events:
         if issues:
             st.warning("Schedule generated, but some items need review. Check the Issues tab.")
         else:
             st.success("Schedule generated successfully.")
-        components.html(render_calendar_html(events, week_start, start_hour, end_hour, px_per_hour), height=(end_hour - start_hour) * px_per_hour + 190, scrolling=True)
-        st.download_button("Download Google Calendar .ics", data=events_to_ics(events, week_start).encode("utf-8"), file_name="weekly_scheduler_export.ics", mime="text/calendar")
+        components.html(
+            render_calendar_html(events, week_start, start_hour, end_hour, px_per_hour),
+            height=(end_hour - start_hour) * px_per_hour + 190,
+            scrolling=True,
+        )
+        st.download_button(
+            "Download Google Calendar .ics",
+            data=events_to_ics(events, week_start).encode("utf-8"),
+            file_name="weekly_scheduler_export.ics",
+            mime="text/calendar",
+        )
     else:
         st.info("Paste your tasks and click Generate schedule to see the calendar.")
 
@@ -472,15 +587,15 @@ with tab_issues:
     st.subheader("Validation")
     if issues:
         st.warning("Some tasks could not be scheduled perfectly.")
-        st.dataframe(pd.DataFrame(issues), use_container_width=True, hide_index=True)
+        st.dataframe(pd.DataFrame(issues), width="stretch", hide_index=True)
     else:
         st.success("No validation issues found." if events else "No schedule generated yet.")
     st.subheader("Unscheduled")
     if unscheduled:
-        st.dataframe(pd.DataFrame([asdict(item) for item in unscheduled]), use_container_width=True, hide_index=True)
+        st.dataframe(pd.DataFrame([asdict(item) for item in unscheduled]), width="stretch", hide_index=True)
     else:
         st.success("Nothing unscheduled." if events else "No schedule generated yet.")
 
 with tab_table:
     st.subheader("Schedule table")
-    st.dataframe(schedule_df, use_container_width=True, hide_index=True)
+    st.dataframe(schedule_df, width="stretch", hide_index=True)

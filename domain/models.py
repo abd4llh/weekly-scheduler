@@ -31,14 +31,7 @@ class EventSource(str, Enum):
 
 @dataclass(frozen=True)
 class TimeWindow:
-    """A weighted preferred time window in minutes after midnight.
-
-    ``weekday`` follows Python's convention: Monday=0 ... Sunday=6. When it is
-    ``None``, the preference applies every day. ``preferred_start_min`` gives
-    the optimizer an ideal point inside the window instead of treating every
-    legal time equally. ``prefer_later_fallback`` makes a time after a blocked
-    window preferable to an equally distant time before it.
-    """
+    """A weighted preferred time window in minutes after midnight."""
 
     start_min: int
     end_min: int
@@ -94,6 +87,7 @@ class PlanningTask:
     fixed_end: Optional[datetime] = None
     required_weekdays: Tuple[int, ...] = ()
     preferred_windows: Tuple[TimeWindow, ...] = ()
+    hard_earliest_min_of_day: Optional[int] = None
     dependencies: Tuple[str, ...] = ()
     min_block_min: int = 30
     max_block_min: int = 180
@@ -108,6 +102,8 @@ class PlanningTask:
     sequence_group: str = ""
     transition_after_min: int = 0
     counts_toward_daily_limit: bool = True
+    counts_toward_total_burden: bool = True
+    counts_as_focused_work: bool = False
 
     def __post_init__(self) -> None:
         if not self.id.strip() or not self.title.strip():
@@ -128,6 +124,9 @@ class PlanningTask:
             raise ValueError("prefer_distinct_session_days requires sessions_required.")
         if any(day not in range(7) for day in self.required_weekdays):
             raise ValueError("required_weekdays values must be between 0 and 6.")
+        if self.hard_earliest_min_of_day is not None:
+            if not 0 <= self.hard_earliest_min_of_day < 24 * 60:
+                raise ValueError("hard_earliest_min_of_day must be between 0 and 1439.")
         if (self.fixed_start is None) != (self.fixed_end is None):
             raise ValueError("fixed_start and fixed_end must be supplied together.")
         if self.fixed_start and self.fixed_end:
@@ -153,6 +152,8 @@ class CalendarEvent:
     locked: bool = True
     busy: bool = True
     source: EventSource = EventSource.IMPORTED
+    location: str = "any"
+    counts_toward_total_burden: bool = True
 
     def __post_init__(self) -> None:
         if not self.id.strip() or not self.title.strip():
@@ -195,6 +196,9 @@ class PlanRequest:
     transition_min: int = 0
     preferred_daily_flexible_min: int = 8 * 60
     max_daily_flexible_min: int = 10 * 60
+    preferred_daily_total_min: int = 10 * 60
+    preferred_daily_focus_min: int = 4 * 60
+    late_focus_start_min: int = 19 * 60
     default_travel_min: int = 20
     compact_gap_min: int = 30
     travel_time_overrides: Tuple[Tuple[str, str, int], ...] = ()
@@ -215,6 +219,10 @@ class PlanRequest:
             raise ValueError("max_daily_flexible_min must be positive.")
         if self.preferred_daily_flexible_min > self.max_daily_flexible_min:
             raise ValueError("Preferred daily load cannot exceed the hard daily maximum.")
+        if self.preferred_daily_total_min <= 0 or self.preferred_daily_focus_min < 0:
+            raise ValueError("Daily burden and focus targets must be non-negative.")
+        if not 0 <= self.late_focus_start_min < 24 * 60:
+            raise ValueError("late_focus_start_min must be between 0 and 1439.")
         if self.default_travel_min < 0 or self.compact_gap_min < 0:
             raise ValueError("Travel and compact-gap settings cannot be negative.")
         for source, destination, minutes in self.travel_time_overrides:

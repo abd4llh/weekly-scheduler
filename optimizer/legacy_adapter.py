@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import re
 from datetime import datetime, time, timedelta
-from typing import Iterable, Sequence, Tuple
+from typing import Dict, Iterable, Sequence, Tuple
 
 from domain import CalendarEvent, EventSource, PlanRequest, PlanningTask, TimeWindow
 from models import DAY_TO_INDEX, Event as LegacyEvent, Task as LegacyTask
 from parser_utils import hhmm_to_minutes
+from routine_utils import routine_requirements_from_settings
 
 
 PRIORITY_TO_SCORE = {
@@ -62,6 +63,23 @@ def _preferred_windows(task: LegacyTask, wake_min: int, sleep_min: int) -> Tuple
     return tuple(TimeWindow(bounds[0], bounds[1], weekday=weekday) for weekday in weekdays)
 
 
+def _routine_windows(settings: Dict | None) -> Dict[str, Tuple[TimeWindow, ...]]:
+    if not settings:
+        return {}
+    output = {}
+    for requirement in routine_requirements_from_settings(settings):
+        output[requirement["title"].strip().lower()] = tuple(
+            TimeWindow(
+                int(requirement["window_start_min"]),
+                int(requirement["window_end_min"]),
+                weekday=day,
+                weight=4,
+            )
+            for day in range(7)
+        )
+    return output
+
+
 def legacy_tasks_to_plan_request(
     tasks: Sequence[LegacyTask],
     week_start: datetime,
@@ -73,6 +91,7 @@ def legacy_tasks_to_plan_request(
     protect_weekend: bool = False,
     transition_min: int = 0,
     timezone: str = "Europe/Berlin",
+    routine_settings: Dict | None = None,
 ) -> PlanRequest:
     """Convert the current app's Task/Event objects into the v0.12 domain model."""
 
@@ -90,6 +109,7 @@ def legacy_tasks_to_plan_request(
         task.title.strip().lower(): task_id
         for task, task_id in zip(tasks, ids)
     }
+    routine_windows = _routine_windows(routine_settings)
 
     canonical_tasks = []
     for task, task_id in zip(tasks, ids):
@@ -133,6 +153,11 @@ def legacy_tasks_to_plan_request(
             if dependency_id:
                 dependencies = (dependency_id,)
 
+        preferred_windows = routine_windows.get(
+            task.title.strip().lower(),
+            _preferred_windows(task, wake_min, sleep_min),
+        )
+
         canonical_tasks.append(
             PlanningTask(
                 id=task_id,
@@ -144,11 +169,12 @@ def legacy_tasks_to_plan_request(
                 fixed_start=fixed_start,
                 fixed_end=fixed_end,
                 required_weekdays=required_days,
-                preferred_windows=_preferred_windows(task, wake_min, sleep_min),
+                preferred_windows=preferred_windows,
                 dependencies=dependencies,
                 min_block_min=max(slot_minutes, int(task.min_block_min or slot_minutes)),
                 max_block_min=max(slot_minutes, int(task.max_block_min or total_duration)),
                 sessions_required=sessions if is_recurring else None,
+                distinct_session_days=is_recurring,
                 splittable=bool(task.splittable or task.task_type in {"Recurring", "Multi-session"}),
                 energy=str(task.energy or "medium").lower(),
                 location=str(task.location or "any").lower(),

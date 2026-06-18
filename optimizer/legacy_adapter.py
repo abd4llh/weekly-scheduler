@@ -26,6 +26,21 @@ ROUTINE_SEQUENCE_RANK = {
     "evening wind-down": 95,
 }
 
+DEFAULT_TRAVEL_OVERRIDES = (
+    ("home", "studio", 10),
+    ("studio", "store", 20),
+    ("home", "store", 20),
+    ("home", "gym", 20),
+    ("studio", "gym", 25),
+    ("lab", "home", 30),
+    ("lab", "studio", 25),
+    ("office", "home", 30),
+    ("office", "studio", 20),
+    ("outside", "home", 20),
+    ("outside", "studio", 20),
+    ("outside", "store", 15),
+)
+
 
 def _slug(value: str) -> str:
     cleaned = re.sub(r"[^a-z0-9]+", "-", value.lower()).strip("-")
@@ -144,6 +159,13 @@ def _daily_sequence_rank(task: LegacyTask) -> int | None:
     return None
 
 
+def _sequence_group(task: LegacyTask) -> str:
+    title = task.title.strip().lower()
+    if title in {"morning routine", "breakfast"} or task.preferred_time == "Morning":
+        return "morning"
+    return ""
+
+
 def _transition_after(task: LegacyTask, transition_min: int) -> int:
     if transition_min <= 0 or task.category == "Routine":
         return 0
@@ -152,6 +174,36 @@ def _transition_after(task: LegacyTask, transition_min: int) -> int:
     if str(task.energy or "").lower() in {"high", "physical", "creative"}:
         return transition_min
     return 0
+
+
+def _effective_location(task: LegacyTask) -> str:
+    explicit = str(task.location or "any").strip().lower()
+    aliases = {
+        "laboratory": "lab",
+        "house": "home",
+        "outdoors": "outside",
+        "shop": "store",
+    }
+    explicit = aliases.get(explicit, explicit)
+    if explicit not in {"", "any"}:
+        return explicit
+
+    text = f"{task.title} {task.notes}".lower()
+    if any(word in text for word in ["art supply", "supply store", "grocery", "groceries", "shop", "store"]):
+        return "store"
+    if any(word in text for word in ["studio", "painting", "paint ", "watercolor", "sketch", "varnish", "artwork"]):
+        return "studio"
+    if any(word in text for word in ["laboratory", " lab ", "experiment", "sensor"]):
+        return "lab"
+    if any(word in text for word in ["gym", "workout", "exercise", "training"]):
+        return "gym"
+    if any(word in text for word in ["office", "workplace"]):
+        return "office"
+    if any(word in text for word in ["market", "doctor", "appointment", "client meeting", "meet with"]):
+        return "outside"
+    if task.category == "Routine" or any(word in text for word in ["cook", "laundry", "house", "home"]):
+        return "home"
+    return "any"
 
 
 def legacy_tasks_to_plan_request(
@@ -164,6 +216,11 @@ def legacy_tasks_to_plan_request(
     slot_minutes: int = 15,
     protect_weekend: bool = False,
     transition_min: int = 0,
+    preferred_daily_flexible_min: int = 8 * 60,
+    max_daily_flexible_min: int = 10 * 60,
+    default_travel_min: int = 20,
+    compact_gap_min: int = 30,
+    travel_time_overrides: Tuple[Tuple[str, str, int], ...] = DEFAULT_TRAVEL_OVERRIDES,
     timezone: str = "Europe/Berlin",
     routine_settings: Dict | None = None,
 ) -> PlanRequest:
@@ -251,12 +308,15 @@ def legacy_tasks_to_plan_request(
                 max_block_min=max(slot_minutes, int(task.max_block_min or total_duration)),
                 sessions_required=requested_sessions,
                 distinct_session_days=is_recurring,
+                prefer_distinct_session_days=is_multi_session and requested_sessions is not None,
                 splittable=bool(task.splittable or task.task_type in {"Recurring", "Multi-session"}),
                 energy=str(task.energy or "medium").lower(),
-                location=str(task.location or "any").lower(),
+                location=_effective_location(task),
                 locked=task.task_type == "Fixed",
                 daily_sequence_rank=_daily_sequence_rank(task),
+                sequence_group=_sequence_group(task),
                 transition_after_min=_transition_after(task, transition_min),
+                counts_toward_daily_limit=task.category != "Routine",
             )
         )
 
@@ -283,5 +343,10 @@ def legacy_tasks_to_plan_request(
         sleep_min=sleep_min,
         protect_weekend=protect_weekend,
         transition_min=transition_min,
+        preferred_daily_flexible_min=preferred_daily_flexible_min,
+        max_daily_flexible_min=max_daily_flexible_min,
+        default_travel_min=default_travel_min,
+        compact_gap_min=compact_gap_min,
+        travel_time_overrides=travel_time_overrides,
         timezone=timezone,
     )

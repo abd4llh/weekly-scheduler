@@ -11,7 +11,7 @@ COGNITIVE_LOADS = ["Low", "Medium", "High"]
 PHYSICAL_LOADS = ["Low", "Medium", "High"]
 SESSION_DISTRIBUTIONS = ["Any", "Prefer different days", "Require different days", "Prefer same day"]
 PLANNING_MODES = ["Balanced week", "Work-heavy week", "Recovery week", "Deadline mode", "Social weekend mode"]
-APP_VERSION = "Weekly Scheduler v0.12.4-alpha — generality refactor"
+APP_VERSION = "Weekly Scheduler v0.12.5-alpha — conference prompt corrections"
 
 @dataclass
 class Task:

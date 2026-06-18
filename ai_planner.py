@@ -7,7 +7,7 @@ from openai import OpenAI
 
 from models import CATEGORIES, DAY_NAMES, DAY_TO_INDEX, Event, Task, UnscheduledTask
 from parser_utils import hhmm_to_minutes, minutes_to_hhmm
-from routine_utils import inject_routine_blocks, routine_anchor_payload
+from routine_utils import normalize_routine_tasks, routine_requirements_payload, validate_routine_requirements
 
 PRIORITIES = ["Critical", "High", "Medium", "Low", "Optional"]
 TASK_TYPES = ["Fixed", "Flexible", "Recurring", "Multi-session"]
@@ -19,15 +19,16 @@ AI_PLANNER_PROMPT = """
 You are the planning brain of a public weekly scheduling app.
 Users may write with grammar mistakes, spelling mistakes, informal wording, transliteration, or mixed languages. Understand intent rather than relying on exact keywords.
 
-Create a complete, realistic weekly calendar from the user's text.
+Create a complete and realistic weekly calendar.
 
 You receive:
 - raw_user_text
 - parsed_task_hints and duration_anchors
-- routine_anchors selected in the sidebar
-- settings, including wake/sleep times, planning mode, and transition time
+- routine_requirements selected in the sidebar
+- settings such as wake/sleep times, planning mode, weekend protection, and transition time
 
-The application inserts routine_anchors deterministically after your response. Do NOT output tasks or events for those automatic routine anchors. Instead, keep their exact time windows free.
+Routine requirements are FLEXIBLE WINDOWS, not fixed appointments.
+For every enabled routine, create exactly one event per day with the exact routine title and source_task. Keep the duration exact and place it anywhere inside the allowed window, preferably near preferred_start. A fixed or critical appointment always takes precedence over the preferred routine time. Move the meal or routine elsewhere inside its window instead of moving the fixed event.
 
 Return ONLY valid JSON:
 {
@@ -46,7 +47,7 @@ Return ONLY valid JSON:
     "min_block_min": 30,
     "max_block_min": 180,
     "can_overlap": false,
-    "category": "Work|Lab|Writing|Admin|Health|Home|Relationship|Social|Learning|Optional|Focus|Other",
+    "category": "Work|Lab|Writing|Admin|Health|Home|Routine|Relationship|Social|Learning|Optional|Focus|Other",
     "required_day": "",
     "earliest_day": "",
     "deadline_day": "",
@@ -67,7 +68,7 @@ Return ONLY valid JSON:
     "start": "HH:MM",
     "end": "HH:MM",
     "priority": "Critical|High|Medium|Low|Optional",
-    "category": "Work|Lab|Writing|Admin|Health|Home|Relationship|Social|Learning|Optional|Focus|Other",
+    "category": "Work|Lab|Writing|Admin|Health|Home|Routine|Relationship|Social|Learning|Optional|Focus|Other",
     "notes": "brief note",
     "explanation": "why this time was selected"
   }],
@@ -77,36 +78,29 @@ Return ONLY valid JSON:
 
 Hard rules:
 - Preserve exact fixed events.
-- Never overlap routine_anchors or other events unless overlap is explicitly allowed.
+- Never overlap events unless overlap is explicitly allowed.
 - Keep events inside wake/sleep time.
-- Respect explicit total durations exactly.
-- Do not silently alter parsed duration anchors or recurrence counts.
-- Recurring duration_min is per session. Multi-session duration_min is the total weekly duration.
+- Respect explicit total durations and recurrence counts exactly.
+- Recurring duration_min is per session. Multi-session duration_min is total weekly duration.
 - Respect required days, time-of-day wording, deadlines, and dependencies.
-- Keep follow-up work after its prerequisite is complete.
+- Keep follow-up work after prerequisites are complete.
 - Do not invent deadlines or dependencies.
-- Use concise English titles even when the input is multilingual.
+- Use concise English titles even when input is multilingual.
+- Routine requirements must remain inside their allowed windows, but preferred_start is only a preference.
 
 Human daily rhythm:
-- Do not place study, writing, creative deep work, lab work, or administrative work immediately after waking.
-- Respect the automatic morning-routine block. After it, use breakfast first when breakfast is enabled.
-- A natural default sequence is: wake/routine -> breakfast -> demanding work or exercise -> lunch -> medium/administrative/errand tasks -> dinner -> social or low-energy tasks -> wind-down.
-- Place cooking or meal preparation before the relevant meal when practical.
-- Prefer high-focus work after the morning routine or breakfast, not at wake-up time.
-- Avoid placing several demanding blocks back-to-back. Use the configured transition_min between long, high-energy, or location-changing tasks when possible.
+- Do not place study, writing, lab work, administrative work, or deep creative work immediately after waking.
+- Use morning routine or breakfast before demanding cognitive work when enabled.
+- A natural sequence is: wake/routine -> breakfast -> demanding work or exercise -> lunch -> medium/administrative/errand tasks -> dinner -> social or low-energy tasks -> wind-down.
+- Put cooking before the relevant meal when practical.
+- Avoid several demanding blocks directly back-to-back.
+- Use transition_min between long, high-energy, or location-changing tasks when possible.
 - Avoid more than 180 minutes of uninterrupted demanding work.
-- Do not fill every free minute. Preserve realistic breathing room.
-
-Time-of-day interpretation:
-- Morning: 06:00-12:00
-- Afternoon: 12:00-18:00
-- Evening: 17:00-22:00
-- Workday: Monday-Friday, normally 09:00-17:00
-- Weekend: Saturday-Sunday
+- Preserve breathing room rather than filling every free minute.
 """
 
 REPAIR_PROMPT = """
-The previous plan failed deterministic validation. Repair the JSON schedule while preserving user intent, duration anchors, fixed events, routine anchors, and realistic daily rhythm. Return ONLY valid JSON with the same shape.
+The previous plan failed deterministic validation. Repair the JSON schedule while preserving user intent, duration anchors, fixed events, flexible routine windows, and realistic daily rhythm. Return ONLY valid JSON with the same shape.
 """
 
 
@@ -255,16 +249,15 @@ def expected_minutes(task: Task) -> int:
 
 
 def time_pref_ok(task: Task, event: Event) -> bool:
-    pref = task.preferred_time
-    if pref == "Morning":
+    if task.preferred_time == "Morning":
         return event.start_min < 12 * 60 and event.end_min <= 13 * 60
-    if pref == "Afternoon":
+    if task.preferred_time == "Afternoon":
         return 12 * 60 <= event.start_min < 18 * 60
-    if pref == "Evening":
+    if task.preferred_time == "Evening":
         return 17 * 60 <= event.start_min < 22 * 60
-    if pref == "Workday":
+    if task.preferred_time == "Workday":
         return event.day_index <= 4 and 8 * 60 <= event.start_min < 18 * 60
-    if pref == "Weekend":
+    if task.preferred_time == "Weekend":
         return event.day_index in [5, 6]
     return True
 
@@ -318,7 +311,7 @@ def apply_duration_anchors(tasks: List[Task], events: List[Event], anchors: List
     return tasks, events
 
 
-def validate_ai_plan(tasks: List[Task], events: List[Event], unscheduled: List[UnscheduledTask], wake_min: int, sleep_min: int, anchors: List[Task] = None) -> List[Dict]:
+def validate_ai_plan(tasks: List[Task], events: List[Event], unscheduled: List[UnscheduledTask], wake_min: int, sleep_min: int, anchors: List[Task] = None, settings: Dict = None) -> List[Dict]:
     issues = []
     task_by_title = {task.title: task for task in tasks}
     unscheduled_titles = {item.title for item in unscheduled}
@@ -346,7 +339,6 @@ def validate_ai_plan(tasks: List[Task], events: List[Event], unscheduled: List[U
         if not task_events and task.title not in unscheduled_titles:
             issues.append({"level": "error", "task": task.title, "message": "Task has no scheduled events and is not listed as unscheduled."})
             continue
-
         if task.task_type == "Fixed" and task_events:
             expected_day = DAY_TO_INDEX.get(task.fixed_day.lower()) if task.fixed_day else None
             expected_start = hhmm_to_minutes(task.fixed_start)
@@ -355,24 +347,19 @@ def validate_ai_plan(tasks: List[Task], events: List[Event], unscheduled: List[U
                 issues.append({"level": "error", "task": task.title, "message": "Fixed task was placed on the wrong day."})
             if expected_start is not None and first.start_min != expected_start:
                 issues.append({"level": "error", "task": task.title, "message": "Fixed task was placed at the wrong start time."})
-
         if task.required_day and task_events:
             required = DAY_TO_INDEX.get(task.required_day.lower())
             if required is not None and any(event.day_index != required for event in task_events):
                 issues.append({"level": "error", "task": task.title, "message": f"Task must be scheduled on {task.required_day}."})
-
         if task.task_type != "Fixed" and not task.fixed_start and task.required_day and task.preferred_time in ["Morning", "Afternoon", "Evening"]:
             if any(not time_pref_ok(task, event) for event in task_events):
                 issues.append({"level": "error", "task": task.title, "message": f"Task says {task.required_day} {task.preferred_time.lower()}, but at least one event is outside that time window."})
-
         if task.task_type == "Recurring" and task_events and len(task_events) != int(task.sessions_per_week):
             issues.append({"level": "error", "task": task.title, "message": f"Recurring task needs {task.sessions_per_week} sessions but has {len(task_events)}."})
-
         scheduled = _scheduled_minutes(task_events)
         expected = expected_minutes(task)
         if task.title not in unscheduled_titles and scheduled != expected:
             issues.append({"level": "error", "task": task.title, "message": f"Scheduled {scheduled} minutes but expected {expected} minutes."})
-
         if task.depends_on and task_events:
             dependency_events = events_by_source.get(task.depends_on, [])
             if not dependency_events:
@@ -397,6 +384,8 @@ def validate_ai_plan(tasks: List[Task], events: List[Event], unscheduled: List[U
         if anchor.task_type == "Recurring" and anchor_events and len(anchor_events) != int(anchor.sessions_per_week):
             issues.append({"level": "error", "task": matched.title, "message": f"Original recurring anchor expected {anchor.sessions_per_week} sessions, but final plan has {len(anchor_events)}."})
 
+    if settings:
+        issues.extend(validate_routine_requirements(events, settings))
     return issues
 
 
@@ -421,16 +410,13 @@ def _payload_from_data(data: Dict) -> Tuple[List[Task], List[Event], List[Unsche
 
 
 def _duration_anchors(parsed_tasks: List[Task]):
-    return [
-        {"title": task.title, "expected_minutes": expected_minutes(task), "task_type": task.task_type, "sessions_per_week": task.sessions_per_week}
-        for task in parsed_tasks
-    ]
+    return [{"title": task.title, "expected_minutes": expected_minutes(task), "task_type": task.task_type, "sessions_per_week": task.sessions_per_week} for task in parsed_tasks]
 
 
 def _prepare_plan(data: Dict, parsed_tasks: List[Task], settings: Dict):
     tasks, events, unscheduled, warnings = _payload_from_data(data)
     tasks, events = apply_duration_anchors(tasks, events, parsed_tasks)
-    tasks, events = inject_routine_blocks(tasks, events, settings)
+    tasks = normalize_routine_tasks(tasks, settings)
     return tasks, events, unscheduled, warnings
 
 
@@ -440,22 +426,21 @@ def plan_week_with_ai(raw_text: str, parsed_tasks: List[Task], api_key: str, mod
     client = OpenAI(api_key=api_key)
     wake_min = int(settings.get("wake_min", 360))
     sleep_min = int(settings.get("sleep_min", 1380))
-    routines = routine_anchor_payload(settings)
+    routines = routine_requirements_payload(settings)
 
     user_payload = {
         "raw_user_text": raw_text,
         "parsed_task_hints": [asdict(task) for task in parsed_tasks],
         "duration_anchors": _duration_anchors(parsed_tasks),
-        "routine_anchors": routines,
+        "routine_requirements": routines,
         "settings": settings,
     }
-    messages = [
+    data = _call_ai(client, model, [
         {"role": "system", "content": AI_PLANNER_PROMPT},
         {"role": "user", "content": json.dumps(user_payload, ensure_ascii=False)},
-    ]
-    data = _call_ai(client, model, messages)
+    ])
     tasks, events, unscheduled, warnings = _prepare_plan(data, parsed_tasks, settings)
-    issues = validate_ai_plan(tasks, events, unscheduled, wake_min, sleep_min, parsed_tasks)
+    issues = validate_ai_plan(tasks, events, unscheduled, wake_min, sleep_min, parsed_tasks, settings)
 
     for _ in range(repair_passes):
         if not issues:
@@ -465,7 +450,7 @@ def plan_week_with_ai(raw_text: str, parsed_tasks: List[Task], api_key: str, mod
             "settings": settings,
             "parsed_task_hints": [asdict(task) for task in parsed_tasks],
             "duration_anchors": _duration_anchors(parsed_tasks),
-            "routine_anchors": routines,
+            "routine_requirements": routines,
             "current_plan": {
                 "tasks": [asdict(task) for task in tasks],
                 "events": [asdict(event) for event in events],
@@ -474,13 +459,12 @@ def plan_week_with_ai(raw_text: str, parsed_tasks: List[Task], api_key: str, mod
             },
             "validation_errors": issues,
         }
-        messages = [
+        data = _call_ai(client, model, [
             {"role": "system", "content": AI_PLANNER_PROMPT},
             {"role": "system", "content": REPAIR_PROMPT},
             {"role": "user", "content": json.dumps(repair_payload, ensure_ascii=False)},
-        ]
-        data = _call_ai(client, model, messages)
+        ])
         tasks, events, unscheduled, warnings = _prepare_plan(data, parsed_tasks, settings)
-        issues = validate_ai_plan(tasks, events, unscheduled, wake_min, sleep_min, parsed_tasks)
+        issues = validate_ai_plan(tasks, events, unscheduled, wake_min, sleep_min, parsed_tasks, settings)
 
     return tasks, events, unscheduled, issues, warnings

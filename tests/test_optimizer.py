@@ -82,12 +82,13 @@ def test_dependency_is_respected():
     assert by_task["draft"].end <= by_task["review"].start
 
 
-def test_recurring_session_count_and_total_duration_are_exact():
+def test_recurring_session_count_duration_and_distinct_days_are_exact():
     task = PlanningTask(
         id="gym",
         title="Gym",
         total_duration_min=180,
         sessions_required=3,
+        distinct_session_days=True,
         min_block_min=60,
         max_block_min=60,
         preferred_windows=(TimeWindow(6 * 60, 10 * 60),),
@@ -99,6 +100,7 @@ def test_recurring_session_count_and_total_duration_are_exact():
     events = [event for event in result.events if event.task_id == "gym"]
     assert len(events) == 3
     assert sum(int((event.end - event.start).total_seconds() // 60) for event in events) == 180
+    assert len({event.start.date() for event in events}) == 3
 
 
 def test_preferred_window_is_used_when_available():

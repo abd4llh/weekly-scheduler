@@ -20,6 +20,11 @@ def _clamp_window(start_min: int, end_min: int, wake_min: int, sleep_min: int):
 
 
 def routine_requirements_from_settings(settings: Dict) -> List[Dict]:
+    """Build flexible daily routine requirements from sidebar settings.
+
+    These are windows, not fixed calendar anchors. The AI chooses the exact time
+    each day around fixed meetings and the logical flow of the day.
+    """
     wake_min = int(settings.get("wake_min", 360))
     sleep_min = int(settings.get("sleep_min", 1380))
     requirements = []
@@ -39,22 +44,73 @@ def routine_requirements_from_settings(settings: Dict) -> List[Dict]:
         })
 
     meal_defaults = [
-        ("Breakfast", "breakfast_enabled", "breakfast_window_start", "07:00", "breakfast_window_end", "10:00", "breakfast_preferred_time", "08:00", "breakfast_duration_min", 30, "Morning"),
-        ("Lunch", "lunch_enabled", "lunch_window_start", "11:30", "lunch_window_end", "15:00", "lunch_preferred_time", "13:00", "lunch_duration_min", 45, "Afternoon"),
-        ("Dinner", "dinner_enabled", "dinner_window_start", "17:30", "dinner_window_end", "21:30", "dinner_preferred_time", "19:00", "dinner_duration_min", 60, "Evening"),
+        (
+            "Breakfast",
+            "breakfast_enabled",
+            "breakfast_window_start",
+            "06:30",
+            "breakfast_window_end",
+            "09:30",
+            "breakfast_preferred_time",
+            "08:00",
+            "breakfast_duration_min",
+            30,
+            "Morning",
+        ),
+        (
+            "Lunch",
+            "lunch_enabled",
+            "lunch_window_start",
+            "11:00",
+            "lunch_window_end",
+            "14:00",
+            "lunch_preferred_time",
+            "13:00",
+            "lunch_duration_min",
+            45,
+            "Afternoon",
+        ),
+        (
+            "Dinner",
+            "dinner_enabled",
+            "dinner_window_start",
+            "18:00",
+            "dinner_window_end",
+            "21:00",
+            "dinner_preferred_time",
+            "19:00",
+            "dinner_duration_min",
+            60,
+            "Evening",
+        ),
     ]
 
-    for (title, enabled_key, start_key, default_start, end_key, default_end, preferred_key, default_preferred, duration_key, default_duration, preferred_time) in meal_defaults:
+    for (
+        title,
+        enabled_key,
+        start_key,
+        default_start,
+        end_key,
+        default_end,
+        preferred_key,
+        default_preferred,
+        duration_key,
+        default_duration,
+        preferred_time,
+    ) in meal_defaults:
         if not settings.get(enabled_key, False):
             continue
+
         start = _to_min(settings.get(start_key), _to_min(default_start, wake_min))
         end = _to_min(settings.get(end_key), _to_min(default_end, sleep_min))
         preferred = _to_min(settings.get(preferred_key), _to_min(default_preferred, start))
         duration = max(15, min(int(settings.get(duration_key, default_duration)), 180))
+
         start, end = _clamp_window(start, end, wake_min, sleep_min)
         if end - start < duration:
             end = min(sleep_min, start + duration)
         preferred = min(max(preferred, start), max(start, end - duration))
+
         requirements.append({
             "title": title,
             "duration_min": duration,
@@ -100,6 +156,10 @@ def routine_requirements_payload(settings: Dict) -> List[Dict]:
             "priority": item["priority"],
             "hard_window": True,
             "fixed_time": False,
+            "instruction": (
+                "Schedule exactly once per day inside the window. Use preferred_start only when it fits; "
+                "fixed and higher-priority events take precedence."
+            ),
         }
         for item in routine_requirements_from_settings(settings)
     ]
@@ -108,6 +168,7 @@ def routine_requirements_payload(settings: Dict) -> List[Dict]:
 def normalize_routine_tasks(tasks: List[Task], settings: Dict) -> List[Task]:
     requirements = {item["title"]: item for item in routine_requirements_from_settings(settings)}
     clean = [task for task in tasks if task.category != ROUTINE_CATEGORY and task.title not in requirements]
+
     for title, item in requirements.items():
         clean.append(Task(
             title=title,
@@ -126,7 +187,10 @@ def normalize_routine_tasks(tasks: List[Task], settings: Dict) -> List[Task]:
             category=ROUTINE_CATEGORY,
             confidence=1.0,
             duration_is_estimated=False,
-            assumptions=(f"Schedule once daily for {item['duration_min']} minutes within {item['window_start']}–{item['window_end']}, preferably near {item['preferred_start']}.")
+            assumptions=(
+                f"Schedule once daily for {item['duration_min']} minutes within "
+                f"{item['window_start']}–{item['window_end']}, preferably near {item['preferred_start']}."
+            ),
         ))
     return clean
 
@@ -134,23 +198,59 @@ def normalize_routine_tasks(tasks: List[Task], settings: Dict) -> List[Task]:
 def validate_routine_requirements(events, settings: Dict) -> List[Dict]:
     issues = []
     requirements = routine_requirements_from_settings(settings)
+    day_names = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+
     for requirement in requirements:
         title = requirement["title"]
         for day in range(7):
-            matches = [event for event in events if event.day_index == day and (event.source_task.strip().lower() == title.lower() or event.title.strip().lower() == title.lower())]
+            matches = [
+                event for event in events
+                if event.day_index == day
+                and (
+                    event.source_task.strip().lower() == title.lower()
+                    or event.title.strip().lower() == title.lower()
+                )
+            ]
             if len(matches) != 1:
-                issues.append({"level": "error", "task": title, "message": f"{title} must appear exactly once on {['Monday','Tuesday','Wednesday','Thursday','Friday','Saturday','Sunday'][day]}; found {len(matches)}."})
+                issues.append({
+                    "level": "error",
+                    "task": title,
+                    "message": f"{title} must appear exactly once on {day_names[day]}; found {len(matches)}.",
+                })
                 continue
+
             event = matches[0]
             actual_duration = event.end_min - event.start_min
             if actual_duration != int(requirement["duration_min"]):
-                issues.append({"level": "error", "task": title, "message": f"{title} must last {requirement['duration_min']} minutes; scheduled {actual_duration} minutes."})
-            if event.start_min < int(requirement["window_start_min"]) or event.end_min > int(requirement["window_end_min"]):
-                issues.append({"level": "error", "task": title, "message": f"{title} must fit inside {requirement['window_start']}–{requirement['window_end']}; scheduled {minutes_to_hhmm(event.start_min)}–{minutes_to_hhmm(event.end_min)}."})
+                issues.append({
+                    "level": "error",
+                    "task": title,
+                    "message": (
+                        f"{title} must last {requirement['duration_min']} minutes; "
+                        f"scheduled {actual_duration} minutes."
+                    ),
+                })
+            if (
+                event.start_min < int(requirement["window_start_min"])
+                or event.end_min > int(requirement["window_end_min"])
+            ):
+                issues.append({
+                    "level": "error",
+                    "task": title,
+                    "message": (
+                        f"{title} must fit inside {requirement['window_start']}–{requirement['window_end']}; "
+                        f"scheduled {minutes_to_hhmm(event.start_min)}–{minutes_to_hhmm(event.end_min)}."
+                    ),
+                })
     return issues
 
 
 def place_routines_flexibly(tasks: List[Task], events: List[Event], settings: Dict) -> Tuple[List[Task], List[Event]]:
+    """Fallback routine placement inside windows after all higher-priority events.
+
+    The AI planner is the primary decision-maker. This helper is used only when
+    the AI planning call fails and the deterministic scheduler is used instead.
+    """
     tasks = normalize_routine_tasks(tasks, settings)
     events = [event for event in events if event.category != ROUTINE_CATEGORY]
 
@@ -172,6 +272,7 @@ def place_routines_flexibly(tasks: List[Task], events: List[Event], settings: Di
                     break
             if chosen is None:
                 continue
+
             events.append(Event(
                 title=requirement["title"],
                 day_index=day,
@@ -180,7 +281,10 @@ def place_routines_flexibly(tasks: List[Task], events: List[Event], settings: Di
                 priority=requirement["priority"],
                 source_task=requirement["title"],
                 notes=requirement["notes"],
-                explanation=f"Placed within the flexible {requirement['window_start']}–{requirement['window_end']} window, near the preferred {requirement['preferred_start']} time while avoiding conflicts.",
+                explanation=(
+                    f"Placed inside the flexible {requirement['window_start']}–{requirement['window_end']} "
+                    f"window while avoiding fixed and higher-priority events."
+                ),
                 category=ROUTINE_CATEGORY,
             ))
 

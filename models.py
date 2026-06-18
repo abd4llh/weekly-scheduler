@@ -8,7 +8,7 @@ PRIORITY_SCORE = {"Critical": 4, "High": 3, "Medium": 2, "Low": 1, "Optional": 0
 ENERGY_SCORE = {"High": 3, "Medium": 2, "Physical": 2, "Creative": 2, "Low": 1}
 CATEGORIES = ["Work", "Lab", "Writing", "Admin", "Health", "Home", "Routine", "Relationship", "Social", "Learning", "Optional", "Focus", "Other"]
 PLANNING_MODES = ["Balanced week", "Work-heavy week", "Recovery week", "Deadline mode", "Social weekend mode"]
-APP_VERSION = "Weekly Scheduler v0.12.1-alpha — scheduling logic patch"
+APP_VERSION = "Weekly Scheduler v0.12.2-alpha — schedule quality model"
 
 @dataclass
 class Task:

@@ -6,95 +6,82 @@ Draft pull request: `#1 — v0.12 optimizer foundation and Streamlit preview`
 
 ## Objective
 
-Move exact calendar placement out of the AI planner and into an OR-Tools CP-SAT optimization engine.
-
-The target pipeline is:
+Move exact calendar placement out of the AI planner and into an OR-Tools CP-SAT optimizer.
 
 ```text
 Natural-language input
-→ AI extracts canonical projects, tasks and constraints
+→ AI extracts profession-independent task metadata
 → CP-SAT optimizer places sessions
 → deterministic validation
 → interactive calendar and selective replanning
 ```
 
-The existing `main` branch remains the stable legacy application while this branch is developed.
+The stable `main` application remains unchanged while this branch is developed.
+
+## Generality boundary
+
+The optimizer does not infer behavior from task titles. It consumes normalized fields:
+
+- duration and block sizes
+- fixed times, required days, earliest starts and deadlines
+- dependency IDs
+- location labels
+- cognitive and physical load
+- task-specific recovery time
+- session-distribution preference
+
+The AI parser may interpret natural language, including specialist terminology and mixed languages. The deterministic adapter only maps structured fields. Unknown metadata receives conservative defaults instead of keyword guesses.
 
 ## Implemented
 
-- Canonical domain models for projects, tasks, events, plans and revisions
-- OR-Tools CP-SAT single-week optimizer
-- Streamlit planning-engine selector and optimizer preview
-- Exact task-duration decomposition into sessions
-- Fixed events and fixed tasks
-- No-overlap constraints
-- Task dependencies
-- Required weekdays
-- Earliest-start and deadline limits
-- Wake/sleep boundaries
-- Preferred time-window targets and fallback penalties
-- Recurring sessions on distinct days
-- Quantity-aware multi-session deliverables
-- Weekend-protection penalty
-- Daily flexible-work target and hard maximum
-- Stronger daily workload balancing
-- Soft distribution of multi-session deliverables across days
-- Location inference and sequence-dependent travel buffers
-- Transition buffers around fixed commitments
-- Compact morning routine sequencing
-- Adapter from the current `models.Task` / `models.Event` objects
-- Optimizer diagnostics in the Streamlit calendar
-- Automated tests and branch-specific GitHub Actions workflow
+- Canonical project, task, event, plan and revision models
+- OR-Tools CP-SAT weekly optimizer
+- Exact duration decomposition and no-overlap rules
+- Fixed events, dependencies, deadlines and weekday restrictions
+- Wake/sleep boundaries and preferred time targets
+- Later-only meal fallback and compact routine sequences
+- Daily flexible-work ceiling, total-burden scoring and focused-work scoring
+- Arbitrary location labels with default travel between different places
+- Explicit task recovery time
+- Explicit session distribution: any, prefer/require different days, or prefer same day
+- User-configurable workload, focus, late-work, travel and routine-gap defaults
+- Streamlit metadata editor and optimizer diagnostics
+- Full application/parser compilation and automated tests
+
+## Testing policy
+
+The demonstration vocabulary must never become an optimizer rule.
+
+- Changing task titles while preserving metadata must preserve solver behavior.
+- Arbitrary location labels must work without a fixed location vocabulary.
+- Session spreading or batching must come from explicit metadata.
+- Random structured scenarios run in CI.
+- `python tools/random_schedule_prompt.py` provides a different cross-domain prompt for manual testing.
+- A failed example may become a regression test, but its profession-specific words may not be added to the adapter.
 
 ## Current hard constraints
 
-- Fixed task times
-- Imported busy events
+- Fixed task times and imported busy events
 - No forbidden overlaps
-- Exact total duration
-- Exact requested recurring-session count
-- Recurring sessions on distinct days
-- Wake and sleep limits
-- Required weekdays
-- Earliest start
-- Deadline
-- Task dependency order
+- Exact total duration and requested session count
+- Required distinct days when explicitly requested or intrinsic to recurrence
+- Wake/sleep limits, required weekdays, earliest starts and deadlines
+- Dependency order
 - Daily flexible-work hard maximum
-- Required transition/travel time between applicable events
+- Required task recovery and inter-location travel time
 
 ## Current soft constraints
 
 - Preferred time windows and preferred start points
-- Later-first meal fallback
-- Weekend avoidance when enabled
-- Earlier placement when no preference exists
-- Preferred daily workload target
-- Balanced daily workload
-- Multi-session distribution across days
-- Compact gaps between morning routine, breakfast and morning practice
-
-## Default schedule-quality values
-
-- Preferred flexible workload: 8 hours per day
-- Hard flexible-work maximum: 10 hours per day
-- Default travel time between different known locations: 20 minutes
-- Compact morning-sequence gap: no more than 30 minutes preferred
-
-Fixed commitments and automatic routines are excluded from the flexible-work ceiling.
-
-## Not implemented yet
-
-- Optional task omission with priority penalties
-- Locked manually moved optimizer events
-- Partial replanning scopes
-- Multi-week project allocation
-- Interactive FullCalendar component
-- Persistence and revision history
-- Alternative schedule generation
+- Weekend protection
+- Daily workload, total burden and focused-work targets
+- Late focused-work penalty
+- Prefer-different-days or prefer-same-day session behavior
+- Compact routine gaps
 
 ## Next milestone
 
-1. Stress-test the schedule-quality model on painter, laboratory, student and household scenarios.
-2. Tune objective weights and defaults from those results.
-3. Start the interactive calendar component with drag, resize and lock support.
+1. Use rotating prompts from unrelated domains for manual stress testing.
+2. Tune defaults only from patterns repeated across multiple scenarios.
+3. Start the interactive calendar with drag, resize and lock support.
 4. Add selective replanning that preserves completed, fixed and user-locked events.

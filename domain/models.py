@@ -89,6 +89,7 @@ class PlanningTask:
     min_block_min: int = 30
     max_block_min: int = 180
     sessions_required: Optional[int] = None
+    distinct_session_days: bool = False
     splittable: bool = True
     energy: str = "medium"
     location: str = "any"
@@ -107,6 +108,8 @@ class PlanningTask:
             raise ValueError("min_block_min cannot exceed max_block_min.")
         if self.sessions_required is not None and self.sessions_required <= 0:
             raise ValueError("sessions_required must be positive when provided.")
+        if self.distinct_session_days and self.sessions_required is None:
+            raise ValueError("distinct_session_days requires sessions_required.")
         if any(day not in range(7) for day in self.required_weekdays):
             raise ValueError("required_weekdays values must be between 0 and 6.")
         if (self.fixed_start is None) != (self.fixed_end is None):

@@ -52,7 +52,7 @@ def test_fixed_task_and_existing_event_are_converted():
     assert request.existing_events[0].end == datetime(2026, 6, 17, 17, 0)
 
 
-def test_routine_settings_become_explicit_daily_preference_windows():
+def test_meal_settings_create_preferred_and_later_fallback_windows():
     lunch = Task(
         title="Lunch",
         duration_min=45,
@@ -83,7 +83,11 @@ def test_routine_settings_become_explicit_daily_preference_windows():
     )
     task = request.tasks[0]
 
-    assert len(task.preferred_windows) == 7
-    assert {window.weekday for window in task.preferred_windows} == set(range(7))
-    assert all(window.start_min == 11 * 60 for window in task.preferred_windows)
-    assert all(window.end_min == 14 * 60 for window in task.preferred_windows)
+    assert len(task.preferred_windows) == 14
+    preferred = [window for window in task.preferred_windows if window.weight == 4]
+    fallback = [window for window in task.preferred_windows if window.weight == 1]
+    assert {window.weekday for window in preferred} == set(range(7))
+    assert all(window.start_min == 11 * 60 for window in preferred)
+    assert all(window.end_min == 14 * 60 for window in preferred)
+    assert all(window.start_min == 14 * 60 for window in fallback)
+    assert all(window.end_min == 23 * 60 for window in fallback)

@@ -12,7 +12,7 @@ from category_utils import normalize_task_categories
 from metrics_utils import workload_summary
 from models import APP_VERSION, CATEGORIES, DAY_NAMES, PLANNING_MODES, PRIORITY_SCORE, Task
 from parser_utils import minutes_to_hhmm, tasks_from_json, tasks_to_json
-from routine_utils import ROUTINE_CATEGORY, inject_routine_blocks, routine_anchor_payload
+from routine_utils import ROUTINE_CATEGORY, place_routines_flexibly, routine_requirements_payload
 from scheduler_engine import Scheduler
 
 st.set_page_config(page_title="Weekly Scheduler", page_icon="🗓️", layout="wide")
@@ -24,12 +24,11 @@ st.markdown(
 .hero {padding: 18px 22px; border: 1px solid #e5e7eb; border-radius: 18px; background: #fff; margin-bottom: 14px; box-shadow: 0 1px 2px rgba(16,24,40,.04);}
 .hero h1 {font-size: 32px; margin: 0 0 6px 0; letter-spacing: -.04em;}
 .hero p {margin: 0; color: #6b7280; font-size: 15px;}
-.small-muted {color:#6b7280; font-size: 13px;}
 div[data-testid="stMetric"] {border: 1px solid #e5e7eb; border-radius: 14px; padding: 10px 13px; background: #fff; box-shadow: 0 1px 2px rgba(16,24,40,.03);}
 </style>
 <div class="hero">
   <h1>Weekly Scheduler</h1>
-  <p>Paste your week in natural language. AI builds a realistic day around routines, meals, energy, and task order.</p>
+  <p>Paste your week in natural language. AI builds a realistic day around flexible routines, meals, energy, and task order.</p>
 </div>
 """,
     unsafe_allow_html=True,
@@ -61,7 +60,7 @@ with st.sidebar:
     sleep_time = st.time_input("Sleep target", value=time(23, 0))
 
     with st.expander("Daily rhythm and meals", expanded=True):
-        morning_ramp_enabled = st.checkbox("Reserve wake-up / get-ready time", value=True)
+        morning_ramp_enabled = st.checkbox("Add morning routine", value=True)
         morning_ramp_min = st.slider(
             "Morning routine duration",
             min_value=15,
@@ -70,28 +69,55 @@ with st.sidebar:
             step=15,
             disabled=not morning_ramp_enabled,
         )
-        st.caption("Prevents study and demanding work from starting immediately after waking.")
+        st.caption("Placed flexibly within the first two hours after waking.")
 
         breakfast_enabled = st.checkbox("Add breakfast", value=False)
-        bc1, bc2 = st.columns(2)
-        with bc1:
-            breakfast_time = st.time_input("Breakfast time", value=time(7, 30), disabled=not breakfast_enabled)
-        with bc2:
-            breakfast_duration_min = st.selectbox("Breakfast min", [15, 30, 45, 60], index=1, disabled=not breakfast_enabled)
+        if breakfast_enabled:
+            b1, b2, b3 = st.columns(3)
+            with b1:
+                breakfast_window_start = st.time_input("Breakfast earliest", value=time(7, 0))
+            with b2:
+                breakfast_preferred_time = st.time_input("Breakfast preferred", value=time(8, 0))
+            with b3:
+                breakfast_window_end = st.time_input("Breakfast latest", value=time(10, 0))
+            breakfast_duration_min = st.selectbox("Breakfast duration", [15, 30, 45, 60], index=1)
+        else:
+            breakfast_window_start = time(7, 0)
+            breakfast_preferred_time = time(8, 0)
+            breakfast_window_end = time(10, 0)
+            breakfast_duration_min = 30
 
         lunch_enabled = st.checkbox("Add lunch", value=False)
-        lc1, lc2 = st.columns(2)
-        with lc1:
-            lunch_time = st.time_input("Lunch time", value=time(13, 0), disabled=not lunch_enabled)
-        with lc2:
-            lunch_duration_min = st.selectbox("Lunch min", [15, 30, 45, 60, 75], index=2, disabled=not lunch_enabled)
+        if lunch_enabled:
+            l1, l2, l3 = st.columns(3)
+            with l1:
+                lunch_window_start = st.time_input("Lunch earliest", value=time(11, 30))
+            with l2:
+                lunch_preferred_time = st.time_input("Lunch preferred", value=time(13, 0))
+            with l3:
+                lunch_window_end = st.time_input("Lunch latest", value=time(15, 0))
+            lunch_duration_min = st.selectbox("Lunch duration", [15, 30, 45, 60, 75], index=2)
+        else:
+            lunch_window_start = time(11, 30)
+            lunch_preferred_time = time(13, 0)
+            lunch_window_end = time(15, 0)
+            lunch_duration_min = 45
 
         dinner_enabled = st.checkbox("Add dinner", value=False)
-        dc1, dc2 = st.columns(2)
-        with dc1:
-            dinner_time = st.time_input("Dinner time", value=time(19, 0), disabled=not dinner_enabled)
-        with dc2:
-            dinner_duration_min = st.selectbox("Dinner min", [30, 45, 60, 75, 90], index=2, disabled=not dinner_enabled)
+        if dinner_enabled:
+            d1, d2, d3 = st.columns(3)
+            with d1:
+                dinner_window_start = st.time_input("Dinner earliest", value=time(17, 30))
+            with d2:
+                dinner_preferred_time = st.time_input("Dinner preferred", value=time(19, 0))
+            with d3:
+                dinner_window_end = st.time_input("Dinner latest", value=time(21, 30))
+            dinner_duration_min = st.selectbox("Dinner duration", [30, 45, 60, 75, 90], index=2)
+        else:
+            dinner_window_start = time(17, 30)
+            dinner_preferred_time = time(19, 0)
+            dinner_window_end = time(21, 30)
+            dinner_duration_min = 60
 
         wind_down_enabled = st.checkbox("Add evening wind-down", value=False)
         wind_down_min = st.slider(
@@ -196,13 +222,19 @@ def settings_payload():
         "morning_ramp_enabled": morning_ramp_enabled,
         "morning_ramp_min": morning_ramp_min,
         "breakfast_enabled": breakfast_enabled,
-        "breakfast_time": _time_text(breakfast_time),
+        "breakfast_window_start": _time_text(breakfast_window_start),
+        "breakfast_preferred_time": _time_text(breakfast_preferred_time),
+        "breakfast_window_end": _time_text(breakfast_window_end),
         "breakfast_duration_min": breakfast_duration_min,
         "lunch_enabled": lunch_enabled,
-        "lunch_time": _time_text(lunch_time),
+        "lunch_window_start": _time_text(lunch_window_start),
+        "lunch_preferred_time": _time_text(lunch_preferred_time),
+        "lunch_window_end": _time_text(lunch_window_end),
         "lunch_duration_min": lunch_duration_min,
         "dinner_enabled": dinner_enabled,
-        "dinner_time": _time_text(dinner_time),
+        "dinner_window_start": _time_text(dinner_window_start),
+        "dinner_preferred_time": _time_text(dinner_preferred_time),
+        "dinner_window_end": _time_text(dinner_window_end),
         "dinner_duration_min": dinner_duration_min,
         "wind_down_enabled": wind_down_enabled,
         "wind_down_min": wind_down_min,
@@ -218,7 +250,7 @@ def deterministic_fallback(tasks):
         planning_mode=planning_mode,
     )
     events, unscheduled = scheduler.schedule(tasks, include_focus_guard)
-    tasks_with_routines, events = inject_routine_blocks(tasks, events, settings_payload())
+    tasks_with_routines, events = place_routines_flexibly(tasks, events, settings_payload())
     issues = validate_ai_plan(
         tasks_with_routines,
         events,
@@ -226,6 +258,7 @@ def deterministic_fallback(tasks):
         wake_time.hour * 60 + wake_time.minute,
         sleep_time.hour * 60 + sleep_time.minute,
         tasks,
+        settings_payload(),
     )
     return tasks_with_routines, events, unscheduled, issues
 
@@ -299,10 +332,16 @@ with tab_tasks:
             except Exception as exc:
                 st.error(f"Could not load JSON: {exc}")
 
-    active_routines = routine_anchor_payload(settings_payload())
+    active_routines = routine_requirements_payload(settings_payload())
     if active_routines:
-        with st.expander("Automatic daily routine blocks", expanded=False):
-            st.dataframe(pd.DataFrame(active_routines)[["title", "start", "end"]], use_container_width=True, hide_index=True)
+        with st.expander("Automatic routine windows", expanded=False):
+            routine_df = pd.DataFrame(active_routines)
+            st.dataframe(
+                routine_df[["title", "duration_min", "window_start", "preferred_start", "window_end"]],
+                use_container_width=True,
+                hide_index=True,
+            )
+            st.caption("Preferred times are flexible. Fixed and critical events take priority; routines move elsewhere inside their allowed windows.")
 
     if st.session_state.ai_warnings:
         with st.expander("Items to review", expanded=True):
@@ -311,7 +350,7 @@ with tab_tasks:
 
     if st.session_state.parsed_tasks:
         st.subheader("Detected tasks")
-        st.caption("Automatic routine blocks are controlled in the sidebar and hidden from this task list.")
+        st.caption("Automatic routine windows are controlled in the sidebar and hidden from this task list.")
         st.dataframe(simple_task_dataframe(st.session_state.parsed_tasks), use_container_width=True, hide_index=True)
 
         with st.expander("Advanced review / edit detected tasks", expanded=False):

@@ -7,8 +7,11 @@ DAY_TO_INDEX = {d.lower(): i for i, d in enumerate(DAY_NAMES)} | {d.lower(): i f
 PRIORITY_SCORE = {"Critical": 4, "High": 3, "Medium": 2, "Low": 1, "Optional": 0}
 ENERGY_SCORE = {"High": 3, "Medium": 2, "Physical": 2, "Creative": 2, "Low": 1}
 CATEGORIES = ["Work", "Lab", "Writing", "Admin", "Health", "Home", "Routine", "Relationship", "Social", "Learning", "Optional", "Focus", "Other"]
+COGNITIVE_LOADS = ["Low", "Medium", "High"]
+PHYSICAL_LOADS = ["Low", "Medium", "High"]
+SESSION_DISTRIBUTIONS = ["Any", "Prefer different days", "Require different days", "Prefer same day"]
 PLANNING_MODES = ["Balanced week", "Work-heavy week", "Recovery week", "Deadline mode", "Social weekend mode"]
-APP_VERSION = "Weekly Scheduler v0.11.4 — routine fallback scheduling"
+APP_VERSION = "Weekly Scheduler v0.12.5-alpha — conference prompt corrections"
 
 @dataclass
 class Task:
@@ -22,6 +25,10 @@ class Task:
     preferred_time: str = "Any"
     energy: str = "Medium"
     location: str = "Any"
+    cognitive_load: str = "Medium"
+    physical_load: str = "Low"
+    session_distribution: str = "Any"
+    recovery_min: int = 0
     splittable: bool = True
     min_block_min: int = 30
     max_block_min: int = 180
@@ -51,6 +58,7 @@ class Event:
     notes: str = ""
     explanation: str = ""
     category: str = "Other"
+    location: str = "Any"
 
 @dataclass
 class UnscheduledTask:

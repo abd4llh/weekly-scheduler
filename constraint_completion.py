@@ -53,6 +53,18 @@ def _event_abs_end(event: Event) -> int:
     return event.day_index * 1440 + event.end_min
 
 
+def _deadline_abs(task: Task) -> Optional[int]:
+    if not task.deadline_day:
+        return None
+    day_index = DAY_TO_INDEX.get(task.deadline_day.lower())
+    if day_index is None:
+        return None
+    deadline_time = hhmm_to_minutes(task.deadline_time) if task.deadline_time else None
+    if deadline_time is None:
+        deadline_time = 24 * 60
+    return day_index * 1440 + deadline_time
+
+
 def _resolve_dependency_title(task: Task, tasks: List[Task]) -> str:
     dependency = str(task.depends_on or "").strip()
     if not dependency:
@@ -100,8 +112,12 @@ def _allowed_days(task: Task) -> List[int]:
             days = [day for day in days if day >= earliest]
     if task.deadline_day:
         latest = DAY_TO_INDEX.get(task.deadline_day.lower())
+        deadline_time = hhmm_to_minutes(task.deadline_time) if task.deadline_time else None
         if latest is not None:
-            days = [day for day in days if day <= latest]
+            if deadline_time == 0:
+                days = [day for day in days if day < latest]
+            else:
+                days = [day for day in days if day <= latest]
     if task.preferred_time == "Weekend":
         days = [day for day in days if day in [5, 6]]
     return days
@@ -180,6 +196,12 @@ def _candidate_slots(
                 score += window_index * 250
                 if day in avoid_days:
                     score += 1000
+                for existing_day in avoid_days:
+                    gap = abs(day - existing_day)
+                    if gap == 1:
+                        score += 180
+                    elif gap == 2:
+                        score += 40
                 if not free_with_buffer:
                     score += 120
                 candidates.append((score, day, start))
@@ -220,6 +242,26 @@ def _trim_surplus(task: Task, events: List[Event], expected: int):
         else:
             event.end_min -= surplus
             surplus = 0
+
+
+def _remove_events_outside_constraints(
+    task: Task,
+    events: List[Event],
+    earliest_abs: Optional[int],
+    latest_abs: Optional[int],
+):
+    allowed_days = set(_allowed_days(task))
+    for event in list(events):
+        if event.source_task != task.title:
+            continue
+        if event.day_index not in allowed_days:
+            events.remove(event)
+            continue
+        if earliest_abs is not None and _event_abs_start(event) < earliest_abs:
+            events.remove(event)
+            continue
+        if latest_abs is not None and _event_abs_end(event) > latest_abs:
+            events.remove(event)
 
 
 def _schedule_recurring_deficit(task: Task, events: List[Event], settings: Dict, earliest_abs: Optional[int], latest_abs: Optional[int]) -> bool:
@@ -328,16 +370,11 @@ def complete_schedule_constraints(
             if dependency_events:
                 dependency_end = max(_event_abs_end(event) for event in dependency_events)
                 earliest_abs = dependency_end + int(settings.get("transition_min", 0))
-                for event in list(events):
-                    if event.source_task == task.title and _event_abs_start(event) < earliest_abs:
-                        events.remove(event)
 
-        latest_abs = None
-        if task.deadline_day:
-            deadline_day = DAY_TO_INDEX.get(task.deadline_day.lower())
-            if deadline_day is not None:
-                deadline_time = hhmm_to_minutes(task.deadline_time) if task.deadline_time else 24 * 60
-                latest_abs = deadline_day * 1440 + int(deadline_time or 24 * 60)
+        latest_abs = _deadline_abs(task)
+
+        if task.task_type != "Fixed":
+            _remove_events_outside_constraints(task, events, earliest_abs, latest_abs)
 
         if task.task_type == "Fixed":
             success = True

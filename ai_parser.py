@@ -62,6 +62,8 @@ Planning constraints:
 - required_day: use when the user specifies a day but not an exact time, e.g. "Sunday afternoon", "Tuesday morning", "on Friday".
 - earliest_day: use when a task should not begin before a day, e.g. "after Wednesday", "once supplies arrive Tuesday".
 - deadline_day/deadline_time: use only for explicit deadline constraints like "before Friday evening", "by Thursday", "due before 18:00". Do not infer a deadline from unrelated future events.
+- A trailing modifier shared by coordinated tasks applies to every task in that coordination. Example: "three hours of A and two hours of B before Sunday" gives both A and B the Sunday deadline.
+- "before <day>" is exclusive: work must finish before 00:00 at the start of that day. "by <day>" includes that day unless a time is stated.
 - depends_on: use only when a task logically depends on another task being done first, e.g. varnishing/packing after painting, editing after drafting, delivery after preparation. Put the clean title of the prerequisite task.
 - phase: rough order group. Use 1 for main/prep work, 2 for follow-up/finishing, 3 for delivery/export/review. Keep 0 if no order is implied.
 
@@ -99,16 +101,20 @@ REPAIR_PROMPT = """
 You previously returned structured tasks, but the validator found consistency problems. Repair the JSON while preserving the user's intent. Do not add new tasks unless one was clearly missed. Return ONLY valid JSON with the same shape: {"tasks": [...], "warnings": [...]}.
 """
 
+
 def _pick(value, allowed, default):
     return value if value in allowed else default
+
 
 def _clean_day(value):
     value = str(value or "").strip()
     return value if value in DAY_NAMES else ""
 
+
 def _clean_hhmm(value):
     value = str(value or "").strip()
     return value if re.match(r"^\d{2}:\d{2}$", value) else ""
+
 
 def _to_int(value, default, lo=None, hi=None):
     try:
@@ -121,12 +127,14 @@ def _to_int(value, default, lo=None, hi=None):
         out = min(hi, out)
     return out
 
+
 def _to_float(value, default=0.8):
     try:
         out = float(value)
     except Exception:
         out = default
     return max(0.0, min(1.0, out))
+
 
 def _to_bool(value, default=False):
     if isinstance(value, bool):
@@ -135,14 +143,18 @@ def _to_bool(value, default=False):
         return value.strip().lower() in ["true", "yes", "1"]
     return default
 
+
 def _has_explicit_time(text):
     return bool(re.search(r"\b\d{1,2}:\d{2}\b", text))
+
 
 def _has_deadline_language(text):
     return any(token in f" {text} " for token in [" before ", " by ", " due ", " deadline ", " no later "])
 
+
 def _has_dependency_language(text):
     return any(token in f" {text} " for token in [" after ", " once ", " following ", " then ", "subsequent", "varnish", "photograph", "packing", "pack", "ship", "deliver", "submit", "finalize", "proofread"])
+
 
 def _infer_repeat_count(text):
     repeat_patterns = [
@@ -156,6 +168,110 @@ def _infer_repeat_count(text):
         if any(pattern in text for pattern in patterns):
             return count
     return None
+
+
+_DEADLINE_PATTERN = re.compile(
+    r"\b(?P<kind>before|by|no\s+later\s+than)\s+"
+    r"(?P<day>Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)"
+    r"(?:\s+(?P<qualifier>morning|afternoon|evening|night|"
+    r"\d{1,2}(?::\d{2})?\s*(?:am|pm)?))?\b",
+    re.IGNORECASE,
+)
+
+_SCOPE_STOPWORDS = {
+    "the", "and", "or", "for", "with", "this", "that", "need", "needs",
+    "hour", "hours", "minute", "minutes", "before", "later", "than", "by",
+    "monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday",
+    "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten",
+    "can", "should", "must", "week", "weekly", "useful", "least", "across",
+}
+
+
+def _scope_tokens(text):
+    return {
+        token
+        for token in re.findall(r"[a-zA-Z0-9]+", str(text).lower())
+        if len(token) > 2 and token not in _SCOPE_STOPWORDS
+    }
+
+
+def _normalize_clock(value):
+    value = str(value or "").strip().lower().replace(" ", "")
+    match = re.fullmatch(r"(\d{1,2})(?::(\d{2}))?(am|pm)?", value)
+    if not match:
+        return ""
+    hour = int(match.group(1))
+    minute = int(match.group(2) or 0)
+    suffix = match.group(3)
+    if minute > 59 or hour > 24:
+        return ""
+    if suffix:
+        if not 1 <= hour <= 12:
+            return ""
+        if suffix == "am":
+            hour = 0 if hour == 12 else hour
+        else:
+            hour = 12 if hour == 12 else hour + 12
+    if hour == 24 and minute != 0:
+        return ""
+    return f"{hour:02d}:{minute:02d}"
+
+
+def _deadline_time(kind, qualifier):
+    kind = re.sub(r"\s+", " ", str(kind or "").strip().lower())
+    qualifier = str(qualifier or "").strip().lower()
+    explicit = _normalize_clock(qualifier)
+    if explicit:
+        return explicit
+    if qualifier == "morning":
+        return "09:00" if kind == "before" else "12:00"
+    if qualifier == "afternoon":
+        return "12:00" if kind == "before" else "18:00"
+    if qualifier == "evening":
+        return "18:00" if kind == "before" else "21:00"
+    if qualifier == "night":
+        return "21:00" if kind == "before" else "23:00"
+    return "00:00" if kind == "before" else "23:59"
+
+
+def _deadline_absolute(day, hhmm):
+    try:
+        day_index = DAY_NAMES.index(day)
+        hour, minute = [int(part) for part in hhmm.split(":", 1)]
+    except (ValueError, AttributeError):
+        return None
+    return day_index * 1440 + hour * 60 + minute
+
+
+def _apply_scoped_deadlines(raw_text, tasks):
+    """Apply trailing deadline modifiers to every coordinated task in their clause."""
+    if not raw_text or not tasks:
+        return tasks
+
+    fragments = [part.strip() for part in re.split(r"(?<=[.!?])\s+|[\r\n]+", raw_text) if part.strip()]
+    for fragment in fragments:
+        previous_end = 0
+        for match in _DEADLINE_PATTERN.finditer(fragment):
+            scope = fragment[previous_end:match.start()]
+            previous_end = match.end()
+            scope_words = _scope_tokens(scope)
+            if not scope_words:
+                continue
+
+            day = match.group("day").capitalize()
+            deadline_time = _deadline_time(match.group("kind"), match.group("qualifier"))
+            new_absolute = _deadline_absolute(day, deadline_time)
+
+            for task in tasks:
+                task_words = _scope_tokens(f"{task.title} {task.notes}")
+                if not task_words.intersection(scope_words):
+                    continue
+                current_absolute = _deadline_absolute(task.deadline_day, task.deadline_time)
+                if current_absolute is None or (new_absolute is not None and new_absolute < current_absolute):
+                    task.deadline_day = day
+                    task.deadline_time = deadline_time
+    return tasks
+
 
 def _postprocess_task(task):
     text = f"{task.title} {task.notes} {task.assumptions}".lower()
@@ -230,6 +346,7 @@ def _postprocess_task(task):
     task.max_block_min = min(max(int(task.max_block_min), int(task.min_block_min)), int(task.duration_min))
     return task
 
+
 def _infer_dependencies(tasks):
     if not tasks:
         return tasks
@@ -263,11 +380,13 @@ def _infer_dependencies(tasks):
                 task.phase = max(getattr(best, "phase", 1) + 1, 2)
     return tasks
 
+
 def _postprocess_tasks(tasks):
     tasks = [_postprocess_task(task) for task in tasks]
     tasks = _infer_dependencies(tasks)
     tasks = [_postprocess_task(task) for task in tasks]
     return tasks
+
 
 def _task_from_dict(item):
     duration = _to_int(item.get("duration_min"), 60, 1, 1440)
@@ -304,8 +423,10 @@ def _task_from_dict(item):
         clarification_question=str(item.get("clarification_question") or ""),
     )
 
+
 def _tasks_to_payload(tasks, warnings=None):
     return {"tasks": [t.__dict__ for t in tasks], "warnings": warnings or []}
+
 
 def validate_ai_tasks(tasks):
     issues = []
@@ -334,6 +455,7 @@ def validate_ai_tasks(tasks):
             issues.append(f"{label}: confidence is low but needs_clarification is false.")
     return issues
 
+
 def _call_ai(client, model, messages):
     response = client.chat.completions.create(
         model=model,
@@ -343,6 +465,7 @@ def _call_ai(client, model, messages):
     )
     return json.loads(response.choices[0].message.content)
 
+
 def parse_tasks_with_ai(raw_text: str, api_key: str, model: str = "gpt-4.1-mini", repair_passes: int = 1, user_defaults=None):
     if not api_key:
         raise ValueError("Missing OpenAI API key.")
@@ -351,7 +474,7 @@ def parse_tasks_with_ai(raw_text: str, api_key: str, model: str = "gpt-4.1-mini"
 
     client = OpenAI(api_key=api_key)
     data = _call_ai(client, model, [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": user_message}])
-    tasks = _postprocess_tasks([_task_from_dict(item) for item in data.get("tasks", [])])
+    tasks = _apply_scoped_deadlines(raw_text, _postprocess_tasks([_task_from_dict(item) for item in data.get("tasks", [])]))
     warnings = list(data.get("warnings", []))
     issues = validate_ai_tasks(tasks)
 
@@ -360,7 +483,7 @@ def parse_tasks_with_ai(raw_text: str, api_key: str, model: str = "gpt-4.1-mini"
             break
         repair_input = {"original_user_text": raw_text, "current_json": _tasks_to_payload(tasks, warnings), "validation_issues": issues}
         data = _call_ai(client, model, [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "system", "content": REPAIR_PROMPT}, {"role": "user", "content": json.dumps(repair_input, ensure_ascii=False)}])
-        tasks = _postprocess_tasks([_task_from_dict(item) for item in data.get("tasks", [])])
+        tasks = _apply_scoped_deadlines(raw_text, _postprocess_tasks([_task_from_dict(item) for item in data.get("tasks", [])]))
         warnings = list(data.get("warnings", []))
         issues = validate_ai_tasks(tasks)
 
